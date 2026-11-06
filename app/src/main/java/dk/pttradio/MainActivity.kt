@@ -171,6 +171,14 @@ class MainActivity : Activity(), RadioView.Listener {
     // ---------------------------------------------------------------- display
 
     private fun updateUi() {
+        if (intent?.getBooleanExtra("demo", false) == true) {  // bruges kun til skærmbilleder i bygningen
+            view.state = RadioView.State(
+                power = true, online = true, rx = true, backlight = 2, txrx = "RX", mode = "DIG",
+                clock = clockFmt.format(Date()), big = "CH 03", name = "CHARLIE", status = "RX ANNA",
+                chFrac = 2f / 7, volFrac = 0.7f
+            )
+            return
+        }
         val r = radio
         val now = System.currentTimeMillis()
         if (entry.isNotEmpty() && now - entryTime > 6000) entry = ""
