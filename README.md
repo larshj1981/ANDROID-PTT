@@ -8,6 +8,12 @@ Tre dele, der alle taler samme protokol:
 
 ## 1. Start hubben
 
+**Windows:** dobbeltklik på `PTTHub.exe` (ligger i PTTRadio-windows, se trin 2). Vinduet viser hubbens adresse.
+Tryk **Tillad** når Windows Firewall spørger. Første gang oprettes `PTTHub-indstillinger.txt` ved siden af
+exe-filen – ret kanalnavne dér og genstart hubben.
+
+**Andre systemer (Linux, Mac, Raspberry Pi):**
+
 ```
 python3 hub/hub.py
 python3 hub/hub.py --channels "Drift,Lager,Kontor,Fritid" --name "Firma-hub"
@@ -22,7 +28,7 @@ python3 hub/hub.py --channels "Drift,Lager,Kontor,Fritid" --name "Firma-hub"
 2. Under fanen **Actions** kører "Byg apps" automatisk (ca. 5 min).
 3. Hent artefakterne:
    - **PTTRadio-android** → installér `app-debug.apk` på telefonen (tillad "installér ukendte apps").
-   - **PTTRadio-windows** → `PTTRadio.exe`, kør den direkte (ingen installation).
+   - **PTTRadio-windows** → `PTTRadio.exe` (radioen) og `PTTHub.exe` (hubben). Kør dem direkte (ingen installation).
      Windows SmartScreen advarer første gang, fordi filen ikke er signeret: "Flere oplysninger" → "Kør alligevel".
 
 **Android Studio:** File → Open → vælg mappen `PTTRadio` → Run.

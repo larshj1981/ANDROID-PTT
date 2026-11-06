@@ -33,7 +33,10 @@ jobs:
           pyinstaller --onefile --noconsole --name PTTRadio
           --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
           windows/pttradio_win.py
+      - run: pyinstaller --onefile --console --name PTTHub hub/hub.py
       - uses: actions/upload-artifact@v4
         with:
           name: PTTRadio-windows
-          path: dist/PTTRadio.exe
+          path: |
+            dist/PTTRadio.exe
+            dist/PTTHub.exe

@@ -8,6 +8,7 @@ Kræver kun Python 3.8+ (ingen ekstra pakker).
     python3 hub.py                              # 8 kanaler, port 50000
     python3 hub.py --channels "Drift,Lager,Kontor,Fritid"
     python3 hub.py --port 50000 --name "Min hub"
+    PTTHub.exe                                  # Windows: læser PTTHub-indstillinger.txt
 
 Protokol (TCP): hver pakke = 1 byte type + 4 byte længde (big-endian) + data.
 Lyd: 16 kHz, mono, 16-bit PCM i bidder af 20 ms.
@@ -17,7 +18,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import socket
 import struct
+import sys
 import time
 
 # Klient -> hub
@@ -196,19 +200,93 @@ class Discovery(asyncio.DatagramProtocol):
             self.transport.sendto(f"PTTHUB {self.hub.port} {self.hub.hub_name}".encode(), addr)
 
 
+SETTINGS_FILE = "PTTHub-indstillinger.txt"
+DEFAULT_SETTINGS = """# PTT Hub – indstillinger
+# Ret linjerne herunder og genstart PTTHub. Linjer der starter med # ignoreres.
+
+# Hubbens navn (vises ved søgning)
+navn = PTT Hub
+
+# Kanalnavne adskilt af komma (op til 99)
+kanaler = Kanal 1, Kanal 2, Kanal 3, Kanal 4, Kanal 5, Kanal 6, Kanal 7, Kanal 8
+
+# Netværksporte (ret kun hvis du ved hvorfor)
+port = 50000
+soegeport = 50001
+"""
+
+
+def app_dir():
+    """Mappen med exe-filen (eller scriptet)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_settings_file():
+    """Læs indstillingsfilen ved siden af programmet. Opretter den med standardværdier første gang."""
+    path = os.path.join(app_dir(), SETTINGS_FILE)
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_SETTINGS)
+        except OSError:
+            return {}, None
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip().lower()] = v.strip()
+    except OSError:
+        pass
+    return cfg, path
+
+
+def local_ips():
+    ips = set()
+    try:  # den adresse, der bruges ud på netværket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            ips.add(ip)
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
+def as_int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 async def main():
+    cfg, cfg_path = load_settings_file()
     ap = argparse.ArgumentParser(description="PTT Radio Hub")
-    ap.add_argument("--port", type=int, default=50000, help="TCP-port (standard 50000)")
-    ap.add_argument("--discovery-port", type=int, default=50001, help="UDP-port til auto-søgning")
-    ap.add_argument("--channels", default="", help='Kanalnavne adskilt af komma, fx "Drift,Lager,Fritid"')
+    ap.add_argument("--port", type=int, default=as_int(cfg.get("port"), 50000), help="TCP-port (standard 50000)")
+    ap.add_argument("--discovery-port", type=int, default=as_int(cfg.get("soegeport"), 50001), help="UDP-port til auto-søgning")
+    ap.add_argument("--channels", default=cfg.get("kanaler", ""), help='Kanalnavne adskilt af komma, fx "Drift,Lager,Fritid"')
     ap.add_argument("--count", type=int, default=8, help="Antal kanaler hvis --channels ikke bruges")
-    ap.add_argument("--name", default="PTT Hub", help="Hubbens navn")
+    ap.add_argument("--name", default=cfg.get("navn", "PTT Hub"), help="Hubbens navn")
     args = ap.parse_args()
 
-    names = [n.strip() for n in args.channels.split(",") if n.strip()] or [f"Kanal {i}" for i in range(1, args.count + 1)]
+    names = [n.strip() for n in args.channels.split(",") if n.strip()][:99] or [f"Kanal {i}" for i in range(1, args.count + 1)]
     hub = Hub(names, args.name, args.port)
 
-    server = await asyncio.start_server(hub.handle, "0.0.0.0", args.port)
+    try:
+        server = await asyncio.start_server(hub.handle, "0.0.0.0", args.port)
+    except OSError as e:
+        raise SystemExit(f"Port {args.port} er optaget – kører PTTHub allerede? ({e})")
     loop = asyncio.get_running_loop()
     try:
         await loop.create_datagram_endpoint(lambda: Discovery(hub), local_addr=("0.0.0.0", args.discovery_port))
@@ -216,14 +294,41 @@ async def main():
         log.warning("Auto-søgning slået fra (%s)", e)
     asyncio.create_task(hub.watchdog())
 
-    log.info("Hub '%s' kører på port %d med %d kanaler: %s", args.name, args.port, len(names), ", ".join(names))
+    ips = local_ips()
+    print("=" * 60)
+    print(f"  PTT HUB '{args.name}' KØRER")
+    print()
+    if ips:
+        print("  Hubbens adresse (skriv i appen, eller tryk Søg):")
+        for ip in ips:
+            print(f"      {ip}" + (f":{args.port}" if args.port != 50000 else ""))
+    print()
+    print(f"  {len(names)} kanaler: " + ", ".join(names))
+    if cfg_path:
+        print(f"  Indstillinger: {cfg_path}")
+    print()
+    print("  Lad dette vindue stå åbent. Luk det for at stoppe hubben.")
+    print("=" * 60)
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+    if sys.platform == "win32":
+        os.system("title PTT Hub")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(f"\nFEJL: {e.code}")
+            if getattr(sys, "frozen", False):
+                input("\nTryk Enter for at lukke…")
+        raise
+    except Exception as e:
+        print(f"\nFEJL: {e}")
+        if getattr(sys, "frozen", False):
+            input("\nTryk Enter for at lukke…")
+        raise
