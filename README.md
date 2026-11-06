@@ -37,13 +37,40 @@ python3 hub/hub.py --channels "Drift,Lager,Kontor,Fritid" --name "Firma-hub"
 
 ## 3. Brug
 
-1. Tryk **Søg** for at finde hubben automatisk (eller skriv IP, fx `192.168.1.10` eller `192.168.1.10:50000`).
-2. Skriv dit kaldenavn og tryk **Forbind**.
-3. Vælg kanal med ◀ ▶. Displayet viser antal brugere og aktivitet på andre kanaler.
-4. **Hold PTT inde** for at tale.
-   - Android: også **lydstyrke ned** eller headset-knappen.
-   - Windows: **mellemrum** i vinduet, eller en **global genvejstast** (standard F8) der virker
-     selvom vinduet er minimeret eller et andet program har fokus. Mikrofon og højttaler vælges nederst.
+1. Tryk **MENU**, tryk **Søg** (eller skriv hubbens adresse, fx `192.168.1.10` – står i PTTHub-vinduet).
+2. Skriv dit kaldenavn og tryk **Gem og tænd**.
+3. Vælg kanal og **hold PTT inde** for at tale. Se "Betjening" herunder.
+
+Kører hub og radio på samme Windows-pc, så skriv `127.0.0.1` som hub-adresse.
+
+## Betjening (Android og Windows)
+
+Begge apps ligner en taktisk håndradio:
+
+| Del | Funktion |
+|---|---|
+| **PTT** (knappen på venstre side) | Hold inde for at tale. Android: også lydstyrke ned. Windows: også mellemrum eller genvejstasten (F8). |
+| **CH-knap** | Tryk på venstre/højre halvdel for forrige/næste kanal (Windows: også musehjul). |
+| **VOL-knap** | Lydstyrke ned/op (Windows: også musehjul eller Page Up/Down). |
+| **Tal + ENT** | Gå direkte til en kanal, fx `1` `2` `ENT` = kanal 12. **CLR** annullerer. |
+| **▲ ▼** | Forrige/næste kanal. |
+| **PWR** | Tænd/sluk (forbind/afbryd). |
+| **MENU** | Hub-adresse, Søg, kaldenavn, radiolyd (og på Windows: mikrofon, højttaler, genvejstast). |
+
+Displayet viser signal, TX/RX, lydtilstand, ur, kanal, kanalnavn og hvem der taler
+(`RX ANNA`, `OPTAGET BO`, `3 STN  AKT 2 5` = 3 stationer på kanalen, aktivitet på kanal 2 og 5).
+LED'en er rød når du sender, grøn når du modtager.
+
+## Radiolyd
+
+Vælges under **MENU → Radiolyd** (hver bruger vælger selv, hvordan den modtagne lyd skal lyde):
+
+- **Digital (MELPe-lignende)** – efterligner MELPe 2400-vocoderen fra digitale taktiske radioer:
+  robotagtig, smalbåndet tale, helt stille mellem ordene, et kort data-burst når nogen trykker og når de slipper.
+- **Analog FM** – smalbåndet, let forvrænget lyd med sus og squelch-hale ("kssh") når der slippes.
+- **Klar** – ren lyd med bip.
+
+Det er en lyd-efterligning på modtagesiden – ikke den rigtige MELPe-codec, og trafikken er uændret.
 
 ## Baggrundsdrift på Android
 

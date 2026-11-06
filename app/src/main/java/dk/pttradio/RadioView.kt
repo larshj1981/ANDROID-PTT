@@ -160,7 +160,7 @@ class RadioView(ctx: Context) : View(ctx) {
         c.drawRect(84f, 333f, 316f, 469f, fill)
         stroke.color = col("#0c0d0b"); stroke.strokeWidth = 2f
         c.drawRect(84f, 333f, 316f, 469f, stroke)
-        val ink = if (st.power) LCD_INK else col("#3c4636")
+        val ink = if (st.power) LCD_INK else col("#5a6a50")
         if (st.power) {
             fill.color = ink
             if (st.online) for (i in 0 until 4) c.drawRect(92f + i * 7, 352f - (i + 1) * 3.5f, 97f + i * 7, 352f, fill)

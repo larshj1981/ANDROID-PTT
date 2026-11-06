@@ -1091,7 +1091,7 @@ class RadioUI:
         else:
             bg = LCD_DIM
         c.itemconfigure(self.lcd, fill=bg)
-        ink = LCD_INK if want else "#3c4636"
+        ink = LCD_INK if want else "#5a6a50"
         for item in (self.lcd_txrx, self.lcd_mode, self.lcd_clock, self.lcd_big, self.lcd_name, self.lcd_status):
             c.itemconfigure(item, fill=ink)
         c.itemconfigure(self.lcd_line, fill=ink)
