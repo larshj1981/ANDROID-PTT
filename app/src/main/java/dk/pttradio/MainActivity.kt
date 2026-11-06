@@ -2,52 +2,61 @@ package dk.pttradio
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.text.InputType
+import android.view.Gravity
 import android.view.KeyEvent
-import android.view.MotionEvent
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-/** Skærmen – al radio-logik ligger i RadioService, så den kører videre i baggrunden. */
-class MainActivity : Activity() {
+/** Skærmen: en taktisk håndradio. Al radio-logik ligger i RadioService (kører i baggrunden). */
+class MainActivity : Activity(), RadioView.Listener {
 
     companion object {
         const val DISCOVERY_PORT = 50001
         const val REQ_PERMS = 1
     }
 
-    private lateinit var hostEdit: EditText
-    private lateinit var nameEdit: EditText
-    private lateinit var connectBtn: Button
-    private lateinit var findBtn: Button
-    private lateinit var statusText: TextView
-    private lateinit var chNumText: TextView
-    private lateinit var chNameText: TextView
-    private lateinit var chInfoText: TextView
-    private lateinit var rxText: TextView
-    private lateinit var pttBtn: Button
-    private lateinit var prevBtn: Button
-    private lateinit var nextBtn: Button
-
+    private lateinit var view: RadioView
+    private lateinit var am: AudioManager
     private val ui = Handler(Looper.getMainLooper())
     private var radio: RadioService? = null
-    private var searchMsg: String? = null
+    private var entry = ""
+    private var entryTime = 0L
+    private var lastActivity = 0L
+    private val clockFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            updateUi()
+            ui.postDelayed(this, 250)
+        }
+    }
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -65,189 +74,284 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        hostEdit = findViewById(R.id.hostEdit)
-        nameEdit = findViewById(R.id.nameEdit)
-        connectBtn = findViewById(R.id.connectBtn)
-        findBtn = findViewById(R.id.findBtn)
-        statusText = findViewById(R.id.statusText)
-        chNumText = findViewById(R.id.chNumText)
-        chNameText = findViewById(R.id.chNameText)
-        chInfoText = findViewById(R.id.chInfoText)
-        rxText = findViewById(R.id.rxText)
-        pttBtn = findViewById(R.id.pttBtn)
-        prevBtn = findViewById(R.id.prevBtn)
-        nextBtn = findViewById(R.id.nextBtn)
-
-        val prefs = getSharedPreferences("ptt", MODE_PRIVATE)
-        hostEdit.setText(prefs.getString("host", ""))
-        nameEdit.setText(prefs.getString("name", ""))
-        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
-
-        connectBtn.setOnClickListener {
-            val r = radio ?: return@setOnClickListener
-            if (r.wantConnected) r.disconnect() else connect(r)
-        }
-        findBtn.setOnClickListener { discover() }
-        prevBtn.setOnClickListener { radio?.changeChannel(-1) }
-        nextBtn.setOnClickListener { radio?.changeChannel(+1) }
-        pttBtn.setOnTouchListener { v, ev ->
-            when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> pttDown()
-                MotionEvent.ACTION_UP -> { radio?.pttUp(); v.performClick() }
-                MotionEvent.ACTION_CANCEL -> radio?.pttUp()
-            }
-            true
-        }
-
+        am = getSystemService(AUDIO_SERVICE) as AudioManager
+        volumeControlStream = AudioManager.STREAM_MUSIC
+        window.statusBarColor = Color.parseColor("#121412")
+        window.navigationBarColor = Color.parseColor("#121412")
+        view = RadioView(this)
+        view.listener = this
+        setContentView(view)
         askPermissions()
-        updateUi()
     }
 
     override fun onStart() {
         super.onStart()
         bindService(Intent(this, RadioService::class.java), conn, Context.BIND_AUTO_CREATE)
+        ui.post(ticker)
     }
 
     override fun onStop() {
-        radio?.pttUp() // send aldrig videre, når skærmen ikke er synlig
+        ui.removeCallbacks(ticker)
+        radio?.pttUp()          // send aldrig videre, når skærmen ikke er synlig
+        view.releasePtt()
         radio?.onChange = null
         radio = null
         unbindService(conn)
         super.onStop()
     }
 
-    private fun connect(r: RadioService) {
-        val host = hostEdit.text.toString().trim()
-        if (host.isEmpty()) {
-            toast("Skriv hubbens adresse, eller tryk Søg")
+    // ---------------------------------------------------------------- RadioView.Listener
+
+    override fun onPtt(down: Boolean) {
+        touch()
+        val r = radio ?: return
+        if (down) {
+            if (!r.pttDown()) askPermissions()
+        } else {
+            r.pttUp()
+        }
+    }
+
+    override fun onChannelStep(d: Int) {
+        touch()
+        entry = ""
+        radio?.changeChannel(d)
+    }
+
+    override fun onVolumeStep(d: Int) {
+        touch()
+        am.adjustStreamVolume(
+            AudioManager.STREAM_MUSIC,
+            if (d > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, 0
+        )
+        val v = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        radio?.flash("VOL ${(v * 10 + max / 2) / max}")
+        updateUi()
+    }
+
+    override fun onKey(name: String) {
+        touch()
+        val r = radio
+        when {
+            name.length == 1 && name[0].isDigit() -> {
+                entry = (entry + name).takeLast(2)
+                entryTime = System.currentTimeMillis()
+            }
+            name == "ENT" -> if (entry.isNotEmpty()) {
+                val n = entry.toInt()
+                entry = ""
+                if (r != null && !r.setChannel(n - 1)) r.flash("UGYLDIG KANAL")
+            }
+            name == "CLR" -> entry = ""
+            name == "UP" -> onChannelStep(1)
+            name == "DN" -> onChannelStep(-1)
+            name == "MENU" -> openMenu()
+            name == "PWR" -> if (r != null) {
+                if (r.wantConnected) r.disconnect() else powerOn(r)
+            }
+        }
+        updateUi()
+    }
+
+    private fun touch() {
+        lastActivity = System.currentTimeMillis()
+    }
+
+    private fun powerOn(r: RadioService) {
+        val prefs = getSharedPreferences("ptt", MODE_PRIVATE)
+        val host = prefs.getString("host", "") ?: ""
+        if (host.isBlank()) {
+            openMenu()
             return
         }
-        getSharedPreferences("ptt", MODE_PRIVATE).edit()
-            .putString("host", host)
-            .putString("name", nameEdit.text.toString().trim())
-            .apply()
-        searchMsg = null
-        r.connect(host, nameEdit.text.toString())
+        r.connect(host, prefs.getString("name", "") ?: "")
     }
 
-    private fun pttDown() {
-        val r = radio ?: return
-        if (!r.pttDown()) askPermissions()
-    }
-
-    // ---------------------------------------------------------------- søgning
-
-    private fun discover() {
-        findBtn.isEnabled = false
-        searchMsg = "Søger efter hub…"
-        updateUi()
-        Thread {
-            var found: String? = null
-            try {
-                DatagramSocket().use { s ->
-                    s.broadcast = true
-                    s.soTimeout = 1500
-                    val msg = "PTTHUB?".toByteArray()
-                    val bcast = InetAddress.getByName("255.255.255.255")
-                    repeat(2) { s.send(DatagramPacket(msg, msg.size, bcast, DISCOVERY_PORT)) }
-                    val buf = ByteArray(256)
-                    val p = DatagramPacket(buf, buf.size)
-                    s.receive(p)
-                    val reply = String(buf, 0, p.length, Charsets.UTF_8)
-                    if (reply.startsWith("PTTHUB ")) {
-                        val port = reply.split(" ").getOrNull(1)?.toIntOrNull() ?: RadioService.DEFAULT_PORT
-                        val ip = p.address.hostAddress
-                        found = if (port == RadioService.DEFAULT_PORT) ip else "$ip:$port"
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            ui.post {
-                val f = found
-                if (f != null) {
-                    hostEdit.setText(f)
-                    searchMsg = "Hub fundet: $f"
-                } else {
-                    searchMsg = "Ingen hub fundet – skriv adressen"
-                }
-                updateUi()
-            }
-        }.start()
-    }
-
-    // ---------------------------------------------------------------- UI
+    // ---------------------------------------------------------------- display
 
     private fun updateUi() {
         val r = radio
-        val want = r?.wantConnected == true
+        val now = System.currentTimeMillis()
+        if (entry.isNotEmpty() && now - entryTime > 6000) entry = ""
+        val power = r?.wantConnected == true
         val online = r?.online == true
-        val pttHeld = r?.pttHeld == true
-        val transmitting = r?.transmitting == true
-        val channel = r?.channel ?: 0
+        val tx = r?.transmitting == true
+        val held = r?.pttHeld == true
+        val rx = r?.receivingFrom
+        if (tx || rx != null) lastActivity = now
+        val ch = r?.channel ?: 0
         val names = r?.channelNames ?: listOf("Kanal 1")
         val status = r?.channelStatus ?: emptyList()
+        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() /
+            am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val chFrac = if (names.size > 1) ch.toFloat() / (names.size - 1) else 0f
 
-        connectBtn.text = if (want) "Afbryd" else "Forbind"
-        connectBtn.isEnabled = r != null
-        hostEdit.isEnabled = !want
-        nameEdit.isEnabled = !want
-        findBtn.isEnabled = !want && searchMsg != "Søger efter hub…"
-        prevBtn.isEnabled = !pttHeld
-        nextBtn.isEnabled = !pttHeld
-
-        statusText.text = if (!want && searchMsg != null) searchMsg else (r?.statusMsg ?: "")
-        chNumText.text = String.format("CH %02d", channel + 1)
-        chNameText.text = names.getOrElse(channel) { "Kanal ${channel + 1}" }
-
-        val st = status.getOrNull(channel)
-        val active = status.withIndex()
-            .filter { it.index != channel && it.value.talker != null }
-            .joinToString(" ") { "CH${it.index + 1}" }
-        chInfoText.text = when {
-            !online -> "—"
-            active.isNotEmpty() -> "${st?.users ?: 0} på kanalen · aktivitet: $active"
-            else -> "${st?.users ?: 0} på kanalen"
+        if (!power) {
+            val hasHost = !getSharedPreferences("ptt", MODE_PRIVATE).getString("host", "").isNullOrBlank()
+            view.state = RadioView.State(
+                big = "OFF", name = if (hasHost) "TRYK PWR" else "TRYK MENU",
+                chFrac = chFrac, volFrac = vol
+            )
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            return
         }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        val name = names.getOrElse(ch) { "Kanal ${ch + 1}" }.uppercase().take(16)
+        val here = status.getOrNull(ch)
         val flash = r?.flashMsg
-        val rx = r?.receivingFrom
-        when {
-            flash != null -> setRx(flash, "#FFB347")
-            transmitting -> setRx("● SENDER", "#FF5A5F")
-            pttHeld -> setRx("Venter på kanal…", "#FFB347")
-            rx != null -> setRx("◀ $rx", "#9CFFB0")
-            else -> setRx("", "#9CFFB0")
+        val line = when {
+            !online -> "SØGER HUB" + ".".repeat(((now / 500) % 4).toInt())
+            flash != null -> flash.uppercase().take(22)
+            tx -> ""
+            held -> "VENTER..."
+            rx != null -> "RX ${rx.uppercase().take(16)}"
+            here?.talker != null -> "OPTAGET ${here.talker.uppercase().take(12)}"
+            else -> {
+                val act = status.withIndex().filter { it.index != ch && it.value.talker != null }
+                    .joinToString(" ") { "${it.index + 1}" }
+                "${here?.users ?: 0} STN" + if (act.isNotEmpty()) "  AKT $act" else ""
+            }
         }
-
-        val busy = st?.talker != null && !transmitting
-        val (color, label) = when {
-            !online -> "#2A2D2E" to "PTT"
-            transmitting -> "#D7263D" to "SENDER"
-            pttHeld -> "#C77D00" to "…"
-            busy -> "#3A3320" to "OPTAGET"
-            else -> "#1F6B3A" to "PTT"
-        }
-        pttBtn.text = label
-        pttBtn.setTextColor(if (online) Color.WHITE else Color.parseColor("#777777"))
-        pttBtn.background = GradientDrawable().apply {
-            setColor(Color.parseColor(color))
-            cornerRadius = 40 * resources.displayMetrics.density
-            setStroke((2 * resources.displayMetrics.density).toInt(), Color.parseColor("#44FFFFFF"))
-        }
+        view.state = RadioView.State(
+            power = true,
+            online = online,
+            tx = tx,
+            rx = rx != null,
+            backlight = if (now - lastActivity < 8000) 2 else 1,
+            txrx = if (tx) "TX" else if (rx != null) "RX" else "",
+            mode = when (r?.fx?.mode) { "fm" -> "FM"; "clear" -> "CLR"; else -> "DIG" },
+            clock = clockFmt.format(Date(now)),
+            big = if (entry.isNotEmpty()) "CH " + entry.padEnd(2, '_') else String.format("CH %02d", ch + 1),
+            name = name,
+            status = line,
+            level = r?.micLevel ?: 0f,
+            showLevel = tx && flash == null,
+            chFrac = chFrac,
+            volFrac = vol,
+        )
     }
 
-    private fun setRx(text: String, color: String) {
-        rxText.text = text
-        rxText.setTextColor(Color.parseColor(color))
+    // ---------------------------------------------------------------- menu (indstillinger)
+
+    private fun openMenu() {
+        val prefs = getSharedPreferences("ptt", MODE_PRIVATE)
+        val dp = resources.displayMetrics.density
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((20 * dp).toInt(), (12 * dp).toInt(), (20 * dp).toInt(), 0)
+        }
+
+        fun label(t: String) = TextView(this).apply {
+            text = t
+            setTextColor(Color.parseColor("#8a8f86"))
+            textSize = 12f
+            setPadding(0, (10 * dp).toInt(), 0, 0)
+        }
+
+        val hostRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val host = EditText(this).apply {
+            setText(prefs.getString("host", ""))
+            hint = "fx 192.168.1.10"
+            inputType = InputType.TYPE_TEXT_VARIATION_URI
+            isSingleLine = true
+        }
+        val find = Button(this).apply { text = "Søg" }
+        hostRow.addView(host, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        hostRow.addView(find)
+        val name = EditText(this).apply {
+            setText(prefs.getString("name", ""))
+            hint = "Dit kaldenavn"
+            inputType = InputType.TYPE_TEXT_VARIATION_PERSON_NAME
+            isSingleLine = true
+        }
+        val modeKeys = VoiceFx.MODES.keys.toList()
+        val mode = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, VoiceFx.MODES.values.toList())
+            setSelection(modeKeys.indexOf(radio?.fx?.mode ?: prefs.getString("mode", "digital")).coerceAtLeast(0))
+        }
+        val help = TextView(this).apply {
+            text = "PTT: side-knappen eller lydstyrke ned.  Kanal: CH-knap, ▲▼ eller tal + ENT.  " +
+                "Lydstyrke: VOL-knap.  PWR: tænd/sluk.  Radioen lytter videre i baggrunden."
+            setTextColor(Color.parseColor("#8a8f86"))
+            textSize = 11f
+            setPadding(0, (14 * dp).toInt(), 0, 0)
+        }
+        box.addView(label("Hub-adresse"))
+        box.addView(hostRow)
+        box.addView(label("Kaldenavn"))
+        box.addView(name)
+        box.addView(label("Radiolyd"))
+        box.addView(mode)
+        box.addView(help)
+
+        find.setOnClickListener {
+            find.isEnabled = false
+            find.text = "…"
+            Thread {
+                val f = discover()
+                ui.post {
+                    find.isEnabled = true
+                    find.text = "Søg"
+                    if (f != null) host.setText(f) else toast("Ingen hub fundet – skriv adressen fra PTTHub-vinduet")
+                }
+            }.start()
+        }
+
+        fun save(): Boolean {
+            val oldHost = prefs.getString("host", "")
+            val oldName = prefs.getString("name", "")
+            val h = host.text.toString().trim()
+            val n = name.text.toString().trim()
+            prefs.edit().putString("host", h).putString("name", n).apply()
+            radio?.setMode(modeKeys[mode.selectedItemPosition.coerceIn(0, modeKeys.size - 1)])
+            return h != oldHost || n != oldName
+        }
+
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Indstillinger")
+            .setView(box)
+            .setPositiveButton("Gem og tænd") { _, _ ->
+                val changed = save()
+                val r = radio ?: return@setPositiveButton
+                if (r.wantConnected && changed) r.disconnect()
+                if (!r.wantConnected) powerOn(r)
+                updateUi()
+            }
+            .setNeutralButton("Gem") { _, _ -> save(); updateUi() }
+            .setNegativeButton("Annullér", null)
+            .show()
+    }
+
+    private fun discover(): String? {
+        try {
+            DatagramSocket().use { s ->
+                s.broadcast = true
+                s.soTimeout = 1500
+                val msg = "PTTHUB?".toByteArray()
+                val bcast = InetAddress.getByName("255.255.255.255")
+                repeat(2) { s.send(DatagramPacket(msg, msg.size, bcast, DISCOVERY_PORT)) }
+                val buf = ByteArray(256)
+                val p = DatagramPacket(buf, buf.size)
+                s.receive(p)
+                val reply = String(buf, 0, p.length, Charsets.UTF_8)
+                if (reply.startsWith("PTTHUB ")) {
+                    val port = reply.split(" ").getOrNull(1)?.toIntOrNull() ?: RadioService.DEFAULT_PORT
+                    val ip = p.address.hostAddress
+                    return if (port == RadioService.DEFAULT_PORT) ip else "$ip:$port"
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return null
     }
 
     // ---------------------------------------------------------------- fysiske knapper
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (isPttKey(keyCode) && radio?.wantConnected == true) {
-            if (event.repeatCount == 0) pttDown()
+            if (event.repeatCount == 0) onPtt(true)
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -255,7 +359,7 @@ class MainActivity : Activity() {
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
         if (isPttKey(keyCode) && radio?.wantConnected == true) {
-            radio?.pttUp()
+            onPtt(false)
             return true
         }
         return super.onKeyUp(keyCode, event)

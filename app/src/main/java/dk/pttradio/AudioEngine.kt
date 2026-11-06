@@ -36,7 +36,7 @@ class AudioEngine {
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .build()
             )
-            .setBufferSizeInBytes(maxOf(min, RATE * 2 / 4)) // ~250 ms
+            .setBufferSizeInBytes(maxOf(min, RATE * 2 / 2)) // ~500 ms
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
         t.play()

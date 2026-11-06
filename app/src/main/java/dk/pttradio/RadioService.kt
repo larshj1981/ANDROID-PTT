@@ -70,6 +70,9 @@ class RadioService : Service() {
         private set
     var flashMsg: String? = null
         private set
+    @Volatile var micLevel = 0f
+        private set
+    val fx = VoiceFx("digital")
     val online: Boolean get() = client?.connected == true
 
     private var host = ""
@@ -83,7 +86,9 @@ class RadioService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        channel = getSharedPreferences("ptt", MODE_PRIVATE).getInt("channel", 0)
+        val prefs = getSharedPreferences("ptt", MODE_PRIVATE)
+        channel = prefs.getInt("channel", 0)
+        fx.setMode(prefs.getString("mode", "digital") ?: "digital")
         tones = try { ToneGenerator(AudioManager.STREAM_MUSIC, 70) } catch (_: Exception) { null }
         audio.startPlayback()
         val nm = getSystemService(NotificationManager::class.java)
@@ -154,12 +159,28 @@ class RadioService : Service() {
         c.connect(host, port, name, channel)
     }
 
+    /** Netværkstråd: lyd (og start/slut-lyde) behandles her, så rækkefølgen bevares. */
     private fun onHubEvent(c: HubClient, e: HubEvent) {
-        if (e is HubEvent.Audio) {
-            if (c === client && !transmitting) audio.play(e.data)
-            return
+        if (c !== client) return
+        when (e) {
+            is HubEvent.Audio -> {
+                if (!transmitting) {
+                    val out = fx.process(e.data)
+                    if (out.isNotEmpty()) audio.play(out)
+                }
+                return
+            }
+            is HubEvent.RxStart -> if (!transmitting) audio.play(fx.startSound())
+            is HubEvent.RxEnd -> if (!transmitting) audio.play(fx.endSound())
+            else -> Unit
         }
         ui.post { if (c === client) handle(e) }
+    }
+
+    fun setMode(m: String) {
+        fx.setMode(m)
+        getSharedPreferences("ptt", MODE_PRIVATE).edit().putString("mode", fx.mode).apply()
+        changed()
     }
 
     private fun handle(e: HubEvent) {
@@ -198,9 +219,8 @@ class RadioService : Service() {
                 if (transmitting) {
                     stopTx()
                     flash("Maks. sendetid nået")
-                } else if (receivingFrom != null) {
+                } else {
                     receivingFrom = null
-                    tone(ToneGenerator.TONE_PROP_BEEP2, 120)
                 }
             }
             is HubEvent.Audio -> Unit
@@ -232,15 +252,28 @@ class RadioService : Service() {
         val wasTx = transmitting
         stopTx()
         client?.send(HubClient.PTT_END)
-        if (wasTx) tone(ToneGenerator.TONE_PROP_BEEP2, 80)
+        if (wasTx && fx.mode == "clear") tone(ToneGenerator.TONE_PROP_BEEP2, 80)
         changed()
     }
 
     private fun startTx() {
         val c = client ?: return
-        tone(ToneGenerator.TONE_PROP_BEEP, 100)
+        if (fx.mode == "clear") tone(ToneGenerator.TONE_PROP_BEEP, 100)
         vibrate(longArrayOf(0, 40))
-        if (!audio.startRecording { chunk -> c.send(HubClient.AUDIO, chunk) }) {
+        micLevel = 0f
+        val ok = audio.startRecording { chunk ->
+            c.send(HubClient.AUDIO, chunk)
+            var ss = 0.0
+            var i = 0
+            while (i + 1 < chunk.size) {
+                val v = ((chunk[i].toInt() and 0xff) or (chunk[i + 1].toInt() shl 8)).toShort() / 32768.0
+                ss += v * v
+                i += 2
+            }
+            val lvl = kotlin.math.sqrt(ss / (chunk.size / 2).coerceAtLeast(1)).toFloat()
+            micLevel = maxOf(lvl, micLevel * 0.8f)
+        }
+        if (!ok) {
             c.send(HubClient.PTT_END)
             flash("Mikrofonen kunne ikke startes")
             return
@@ -254,13 +287,19 @@ class RadioService : Service() {
         audio.stopRecording()
     }
 
+    fun setChannel(idx: Int): Boolean {
+        if (idx !in channelNames.indices) return false
+        changeChannel(idx - channel)
+        return true
+    }
+
     fun changeChannel(delta: Int) {
         if (pttHeld || transmitting) return
         val n = channelNames.size
         channel = ((channel + delta) % n + n) % n
         receivingFrom = null
         client?.send(HubClient.JOIN, channel.toString().toByteArray())
-        tone(ToneGenerator.TONE_PROP_BEEP, 40)
+        tone(ToneGenerator.TONE_PROP_BEEP, 30)
         saveChannel()
         changed()
     }
@@ -351,7 +390,7 @@ class RadioService : Service() {
         if (wantConnected) try { goForeground() } catch (_: Exception) {}
     }
 
-    private fun flash(msg: String) {
+    fun flash(msg: String) {
         flashMsg = msg
         ui.removeCallbacks(clearFlash)
         ui.postDelayed(clearFlash, 1800)

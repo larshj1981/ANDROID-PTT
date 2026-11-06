@@ -14,6 +14,7 @@ import json
 import math
 import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -615,11 +616,16 @@ class RadioUI:
 
         # skalering efter skærmens DPI og højde
         dpi = root.winfo_fpixels("1i") / 96.0
-        self.s = max(0.6, min(dpi, (root.winfo_screenheight() - 90) / self.H))
+        self.s = max(0.55, min(dpi, (root.winfo_screenheight() - 130 * dpi) / self.H))
 
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
+        pos = self.settings.get("position")
+        if pos and re.fullmatch(r"\+-?\d+\+-?\d+", pos):
+            root.geometry(pos)
+        else:
+            root.geometry(f"+{int(root.winfo_screenwidth() / 2 - self.S(self.W) / 2)}+{int(10 * dpi)}")
         self.c = tk.Canvas(root, width=self.S(self.W), height=self.S(self.H), bg=BG, highlightthickness=0)
         self.c.pack()
         self._draw_static()
@@ -677,11 +683,11 @@ class RadioUI:
         self.rr(62, 150, 118, 205, 8, fill="#202220", outline="#30332e")
 
         # topplade med knapper
-        self.rr(140, 112, 356, 205, 14, fill="#22241f", outline="#363a33", width=2)
-        self.ch_knob = self._knob(196, 148, 33, "CH", tag="chknob")
-        self.vol_knob = self._knob(306, 150, 26, "VOL", tag="volknob")
-        self.led = self.oval(252, 132, 6, fill="#3a2a2a", outline="#111")
-        self.text(252, 147, text="TX/RX", fill=MUTED, font=self.UF(8))
+        self.rr(140, 100, 356, 205, 14, fill="#22241f", outline="#363a33", width=2)
+        self.ch_knob = self._knob(196, 138, 31, "CH", tag="chknob")
+        self.vol_knob = self._knob(306, 140, 25, "VOL", tag="volknob")
+        self.led = self.oval(252, 124, 6, fill="#3a2a2a", outline="#111")
+        self.text(252, 139, text="TX/RX", fill=MUTED, font=self.UF(8))
 
         # krop
         self.rr(38, 190, 362, 790, 38, fill=BODY, outline=BODY_EDGE, width=3)
@@ -741,7 +747,7 @@ class RadioUI:
                                fill="#1a1b18", width=max(1, int(self.S(2))), tags=tag)
         self.oval(cx, cy, r * 0.55, fill="#33362f", outline="#1d1e1b", tags=tag)
         ptr = self.c.create_line(0, 0, 1, 1, fill="#f0f0e0", width=max(2, int(self.S(3))), capstyle="round", tags=tag)
-        self.text(cx, cy + r + 13, text=label, fill=MUTED, font=self.UF(9, "bold"))
+        self.text(cx, cy + r + 11, text=label, fill=MUTED, font=self.UF(9, "bold"))
         return (cx, cy, r, ptr)
 
     def _set_knob(self, knob, frac):
@@ -1044,6 +1050,7 @@ class RadioUI:
         save_settings(self.settings)
 
     def _quit(self):
+        self.settings["position"] = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
         self._save()
         self.hotkey.stop()
         self.core.disconnect()
