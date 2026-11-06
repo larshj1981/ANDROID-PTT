@@ -34,6 +34,17 @@ jobs:
           --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
           windows/pttradio_win.py
       - run: pyinstaller --onefile --console --name PTTHub hub/hub.py
+      - name: Skærmbillede af interfacet
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          pip install pillow
+          $env:PTT_SCREENSHOT = "$PWD\shot.png"
+          python windows/pttradio_win.py
+          foreach ($f in "shot.png","shot_menu.png") {
+            if (Test-Path $f) { Write-Output "BEGIN-$f"; [Convert]::ToBase64String([IO.File]::ReadAllBytes($f)); Write-Output "END-$f" }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: PTTRadio-windows
