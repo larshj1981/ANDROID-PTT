@@ -70,7 +70,8 @@ TONE_CLICK = tone_pcm(1800, 25, vol=0.12)
 
 # ------------------------------------------------------------------ lyd
 class AudioIO:
-    """Afspilning via en løbende udgangsstrøm med lille jitterbuffer; optagelse kun mens der sendes."""
+    """Lydmotor til flere net: én udgangsstrøm der mixer en buffer pr. net (med mute og
+    stereo-placering), og én mikrofon der deles af alle net der sender."""
 
     MAX_BUFFER = int(RATE * 2 * 1.0)   # maks. 1 s forsinkelse før gammel lyd smides væk
     PRIME = CHUNK_BYTES * 3             # 60 ms forbuffer for netværkslyd
@@ -79,13 +80,19 @@ class AudioIO:
         import sounddevice as sd
         self.sd = sd
         self.lock = threading.Lock()
-        self.buf = bytearray()
-        self.primed = False
+        self.ports = []
         self.out = None
         self.inp = None
         self.in_dev = None
         self.out_dev = None
         self.volume = 0.8
+        self._in_subs = {}
+        self._in_lock = threading.Lock()
+
+    def port(self):
+        p = AudioPort(self)
+        self.ports.append(p)
+        return p
 
     # --- enheder
     def devices(self):
@@ -109,14 +116,23 @@ class AudioIO:
         self.in_dev, self.out_dev = in_dev, out_dev
         self.stop_output()
         self.start_output()
+        with self._in_lock:
+            if self.inp:
+                self._close_input()
+                self._open_input()
 
-    # --- afspilning
+    # --- afspilning (stereo, mix af alle net)
     def start_output(self):
         if self.out:
             return
-        self.out = self.sd.RawOutputStream(
-            samplerate=RATE, channels=1, dtype="int16", blocksize=CHUNK_SAMPLES,
-            device=self.out_dev, latency="low", callback=self._out_cb)
+        try:
+            self.out = self.sd.RawOutputStream(
+                samplerate=RATE, channels=2, dtype="int16", blocksize=CHUNK_SAMPLES,
+                device=self.out_dev, latency="low", callback=self._out_cb)
+        except Exception:  # enhed uden stereo
+            self.out = self.sd.RawOutputStream(
+                samplerate=RATE, channels=1, dtype="int16", blocksize=CHUNK_SAMPLES,
+                device=self.out_dev, latency="low", callback=self._out_cb)
         self.out.start()
 
     def stop_output(self):
@@ -129,44 +145,51 @@ class AudioIO:
             self.out = None
 
     def _out_cb(self, outdata, frames, time_info, status):
+        chans = self.out.channels if self.out else 2
+        left = np.zeros(frames, dtype=np.float32)
+        right = np.zeros(frames, dtype=np.float32)
         need = frames * 2
         with self.lock:
-            if not self.primed and len(self.buf) >= self.PRIME:
-                self.primed = True
-            if self.primed and self.buf:
-                take = bytes(self.buf[:need])
-                del self.buf[:need]
-                if not self.buf:
-                    self.primed = False
-            else:
-                take = b""
-        if len(take) < need:
-            take += b"\x00" * (need - len(take))
+            for p in self.ports:
+                take = p._take(need)
+                if not take:
+                    continue
+                a = np.frombuffer(take, dtype=np.int16).astype(np.float32)
+                if len(a) < frames:
+                    a = np.concatenate([a, np.zeros(frames - len(a), dtype=np.float32)])
+                if p.muted:
+                    continue
+                left += a * p.gain_l
+                right += a * p.gain_r
         v = self.volume
-        if v < 0.999:
-            a = (np.frombuffer(take, dtype=np.int16) * v).astype(np.int16)
-            take = a.tobytes()
-        outdata[:] = take
+        if chans == 1:
+            mix = np.clip((left + right) * 0.5 * v, -32767, 32767).astype(np.int16)
+        else:
+            mix = np.empty(frames * 2, dtype=np.float32)
+            mix[0::2] = left * v
+            mix[1::2] = right * v
+            mix = np.clip(mix, -32767, 32767).astype(np.int16)
+        outdata[:] = mix.tobytes()
 
-    def play(self, data, immediate=False):
-        with self.lock:
-            self.buf.extend(data)
-            if len(self.buf) > self.MAX_BUFFER:
-                del self.buf[: len(self.buf) - self.MAX_BUFFER]
-            if immediate:
-                self.primed = True
+    # --- optagelse (én mikrofon deles af alle net)
+    def subscribe_input(self, key, on_chunk):
+        with self._in_lock:
+            self._in_subs[key] = on_chunk
+            if self.inp is None:
+                return self._open_input()
+            return True
 
-    def clear(self):
-        with self.lock:
-            self.buf.clear()
-            self.primed = False
+    def unsubscribe_input(self, key):
+        with self._in_lock:
+            self._in_subs.pop(key, None)
+            if not self._in_subs:
+                self._close_input()
 
-    # --- optagelse
-    def start_input(self, on_chunk):
-        self.stop_input()
-
+    def _open_input(self):
         def cb(indata, frames, time_info, status):
-            on_chunk(bytes(indata))
+            chunk = bytes(indata)
+            for f in list(self._in_subs.values()):
+                f(chunk)
 
         try:
             self.inp = self.sd.RawInputStream(
@@ -178,7 +201,7 @@ class AudioIO:
             self.inp = None
             return False
 
-    def stop_input(self):
+    def _close_input(self):
         if self.inp:
             try:
                 self.inp.stop()
@@ -186,6 +209,57 @@ class AudioIO:
             except Exception:
                 pass
             self.inp = None
+
+    def stop_input(self):
+        with self._in_lock:
+            self._in_subs.clear()
+            self._close_input()
+
+
+class AudioPort:
+    """Ét nets adgang til lydmotoren (samme metoder som RadioCore forventer)."""
+
+    def __init__(self, io):
+        self.io = io
+        self.buf = bytearray()
+        self.primed = False
+        self.muted = False
+        self.gain_l = self.gain_r = 1.0
+
+    def set_pan(self, pan):
+        """pan: -1 = venstre, 0 = midt, 1 = højre."""
+        self.gain_l = min(1.0, 1.0 - pan)
+        self.gain_r = min(1.0, 1.0 + pan)
+
+    def _take(self, need):  # kaldes med io.lock
+        if not self.primed and len(self.buf) >= self.io.PRIME:
+            self.primed = True
+        if self.primed and self.buf:
+            take = bytes(self.buf[:need])
+            del self.buf[:need]
+            if not self.buf:
+                self.primed = False
+            return take
+        return b""
+
+    def play(self, data, immediate=False):
+        with self.io.lock:
+            self.buf.extend(data)
+            if len(self.buf) > self.io.MAX_BUFFER:
+                del self.buf[: len(self.buf) - self.io.MAX_BUFFER]
+            if immediate:
+                self.primed = True
+
+    def clear(self):
+        with self.io.lock:
+            self.buf.clear()
+            self.primed = False
+
+    def start_input(self, on_chunk):
+        return self.io.subscribe_input(id(self), on_chunk)
+
+    def stop_input(self):
+        self.io.unsubscribe_input(id(self))
 
 
 # ------------------------------------------------------------------ radio-kerne (netværk + tilstand)
@@ -511,95 +585,176 @@ def save_settings(data):
         pass
 
 
-# ------------------------------------------------------------------ global genvejstast
-HOTKEYS = ["Ingen", "F7", "F8", "F9", "F10", "F11", "F12", "Scroll Lock", "Pause", "Højre Ctrl", "Højre Alt"]
+# ------------------------------------------------------------------ PTT-taster (vilkårlig tast eller museknap)
+_KEY_NAMES = {
+    "space": "Mellemrum", "ctrl_l": "Venstre Ctrl", "ctrl_r": "Højre Ctrl", "alt_l": "Venstre Alt",
+    "alt_r": "Højre Alt", "alt_gr": "Alt Gr", "shift": "Venstre Shift", "shift_r": "Højre Shift",
+    "caps_lock": "Caps Lock", "scroll_lock": "Scroll Lock", "pause": "Pause", "insert": "Insert",
+    "delete": "Delete", "home": "Home", "end": "End", "page_up": "Page Up", "page_down": "Page Down",
+    "up": "Pil op", "down": "Pil ned", "left": "Pil venstre", "right": "Pil højre", "tab": "Tab",
+    "enter": "Enter", "backspace": "Backspace", "num_lock": "Num Lock", "print_screen": "Print Screen",
+    "menu": "Menu-tast", "cmd": "Windows-tast", "cmd_r": "Højre Windows-tast", "esc": "Esc",
+}
+_MOUSE_NAMES = {"middle": "Midterste museknap", "right": "Højre museknap", "x1": "Mus side-knap 1 (tilbage)",
+                "x2": "Mus side-knap 2 (frem)"}
+_LEGACY = {"F7": "key:f7", "F8": "key:f8", "F9": "key:f9", "F10": "key:f10", "F11": "key:f11", "F12": "key:f12",
+           "Scroll Lock": "key:scroll_lock", "Pause": "key:pause", "Højre Ctrl": "key:ctrl_r",
+           "Højre Alt": "key:alt_r", "Ingen": ""}
 
 
-class GlobalHotkey:
-    """Hold-for-at-tale med en tast, der virker selvom vinduet ikke har fokus (kræver pynput)."""
+def key_label(kid):
+    """Menneskeligt navn for en gemt tast-id, fx 'key:f8' -> 'F8', 'vk:65' -> 'A', 'mouse:x1' -> ..."""
+    if not kid:
+        return "Ingen"
+    kind, _, v = kid.partition(":")
+    if kind == "key":
+        if v.startswith("f") and v[1:].isdigit():
+            return v.upper()
+        return _KEY_NAMES.get(v, v.replace("_", " ").title())
+    if kind == "vk":
+        n = int(v) if v.isdigit() else 0
+        if 48 <= n <= 57 or 65 <= n <= 90:
+            return chr(n)
+        if 96 <= n <= 105:
+            return f"Num {n - 96}"
+        names = {106: "Num *", 107: "Num +", 109: "Num -", 110: "Num ,", 111: "Num /", 186: "Æ", 192: "Ø",
+                 222: "Å", 187: "+", 189: "-", 188: ",", 190: ".", 191: "'", 220: "½", 226: "<"}
+        return names.get(n, f"Tast {n}")
+    if kind == "char":
+        return v.upper()
+    if kind == "mouse":
+        return _MOUSE_NAMES.get(v, f"Museknap {v}")
+    return kid
 
-    def __init__(self, on_down, on_up):
-        self.on_down, self.on_up = on_down, on_up
-        self.listener = None
-        self.target = None
+
+class HotkeyManager:
+    """Global lytning på tastatur og mus (virker også når vinduet er minimeret). Hvert net har sin egen tast."""
+
+    def __init__(self):
+        self.binds = {}          # tast-id -> (on_down, on_up)
+        self.capture_cb = None
+        self.paused = lambda: False
+        self.down = set()
         try:
-            from pynput import keyboard
-            self.kb = keyboard
+            from pynput import keyboard, mouse
+            self.kb, self.ms = keyboard, mouse
         except Exception:
-            self.kb = None
+            self.kb = self.ms = None
+        self._kl = self._ml = None
 
     @property
     def available(self):
         return self.kb is not None
 
-    def _key_for(self, label):
-        K = self.kb.Key
-        m = {"Scroll Lock": K.scroll_lock, "Pause": K.pause, "Højre Ctrl": K.ctrl_r, "Højre Alt": K.alt_r}
-        if label in m:
-            return m[label]
-        if label.startswith("F") and label[1:].isdigit():
-            return getattr(K, label.lower(), None)
-        return None
-
-    def set(self, label):
-        self.stop()
-        if not self.kb or label == "Ingen":
+    def start(self):
+        if not self.kb or self._kl:
             return
-        self.target = self._key_for(label)
-        if self.target is None:
-            return
-
-        def press(key):
-            if key == self.target:
-                self.on_down()
-
-        def release(key):
-            if key == self.target:
-                self.on_up()
-
-        self.listener = self.kb.Listener(on_press=press, on_release=release)
-        self.listener.daemon = True
-        self.listener.start()
+        self._kl = self.kb.Listener(on_press=lambda k: self._ev(self._kid(k), True),
+                                    on_release=lambda k: self._ev(self._kid(k), False))
+        self._kl.daemon = True
+        self._kl.start()
+        self._ml = self.ms.Listener(on_click=self._click)
+        self._ml.daemon = True
+        self._ml.start()
 
     def stop(self):
-        if self.listener:
-            self.listener.stop()
-            self.listener = None
+        for listener in (self._kl, self._ml):
+            if listener:
+                listener.stop()
+        self._kl = self._ml = None
+
+    def _kid(self, k):
+        if k is None:
+            return None
+        if isinstance(k, self.kb.Key):
+            return f"key:{k.name}"
+        vk = getattr(k, "vk", None)
+        if vk:
+            return f"vk:{vk}"
+        ch = getattr(k, "char", None)
+        return f"char:{ch.lower()}" if ch else None
+
+    def _click(self, x, y, button, pressed):
+        name = getattr(button, "name", str(button))
+        if name == "left":
+            return  # venstre museknap bruges til at betjene vinduet
+        self._ev(f"mouse:{name}", pressed)
+
+    def _ev(self, kid, pressed):
+        if not kid:
+            return
+        if self.capture_cb:
+            if pressed:
+                cb, self.capture_cb = self.capture_cb, None
+                cb(None if kid == "key:esc" else kid)
+            return
+        if pressed:
+            if kid in self.down:
+                return  # autogentagelse
+            self.down.add(kid)
+        else:
+            self.down.discard(kid)
+        b = self.binds.get(kid)
+        if not b:
+            return
+        if pressed and self.paused():
+            return
+        (b[0] if pressed else b[1])()
+
+    def bind(self, kid, on_down, on_up):
+        if kid:
+            self.binds[kid] = (on_down, on_up)
+
+    def clear(self):
+        self.binds.clear()
+
+    def capture(self, cb):
+        """Næste tast/museknap sendes til cb(tast-id) (Esc = annullér -> None)."""
+        self.capture_cb = cb
 
 
-# ------------------------------------------------------------------ brugerflade: taktisk håndradio
+# ------------------------------------------------------------------ brugerflade: 2 net efter skitse
 BG = "#121412"
 BODY = "#2b2e29"
 BODY_EDGE = "#3d4239"
-FACE = "#24261f"
-KEY = "#3b3f38"
-KEY_DOWN = "#1f221d"
-KEY_TXT = "#e8e8e0"
+BTN = "#3b3f38"
+BTN_DOWN = "#1f221d"
+BTN_EDGE = "#4f554a"
+TXT = "#e8e8e0"
 LCD_OFF = "#2f362b"
 LCD_DIM = "#7c8f6a"
 LCD_ON = "#a9c98a"
 LCD_INK = "#16200e"
+LCD_OFF_INK = "#5a6a50"
 MUTED = "#8a8f86"
 FG = "#e6e6e0"
+AMBER = "#e0b050"
+NETS = 2
 
-KEY_ROWS = [["1", "2", "3", "UP"], ["4", "5", "6", "DN"], ["7", "8", "9", "MENU"], ["CLR", "0", "ENT", "PWR"]]
-KEY_LABEL = {"UP": "▲", "DN": "▼"}
-KEY_COLOR = {"MENU": "#e0b050", "CLR": "#e0b050", "ENT": "#8fd08f", "PWR": "#ff6a5a"}
+
+class Net:
+    """Ét net: en radiokerne, en lydport og dets indstillinger."""
+
+    def __init__(self, idx, audio, notify, cfg):
+        self.idx = idx
+        self.port = audio.port()
+        self.core = RadioCore(self.port, notify=notify)
+        self.cfg = cfg
+        self.core.channel = int(cfg.get("channel", idx))
+        self.port.muted = bool(cfg.get("muted", False))
+        self.last_activity = 0.0
 
 
 class RadioUI:
-    W, H = 400, 800
+    W, H = 860, 520
 
     def __init__(self, root):
         self.root = root
         self.settings = load_settings()
+        self._migrate()
         self._dirty = threading.Event()
-        self.entry = ""
-        self.entry_time = 0.0
-        self.last_activity = 0.0
         self.menu = None
-        self._release_job = None
-        self._pressed_key = None
+        self._pressed = None
 
         try:
             self.audio = AudioIO()
@@ -607,16 +762,21 @@ class RadioUI:
             messagebox.showerror(APP_NAME, f"Lydsystemet kunne ikke startes:\n{e}")
             raise SystemExit(1)
 
-        self.core = RadioCore(self.audio, notify=self._dirty.set)
-        self.core.channel = int(self.settings.get("channel", 0))
-        self.core.fx.set_mode(self.settings.get("mode", "digital"))
+        self.nets = [Net(i, self.audio, self._dirty.set, self.settings["nets"][i]) for i in range(NETS)]
+        for n in self.nets:
+            n.core.fx.set_mode(self.settings.get("mode", "digital"))
         self.volume = int(self.settings.get("volume", 7))
         self._apply_volume()
-        self.hotkey = GlobalHotkey(self.core.ptt_down, self.core.ptt_up)
+        self._apply_pan()
 
-        # skalering efter skærmens DPI og højde
+        self.hotkeys = HotkeyManager()
+        self.hotkeys.paused = self._typing_in_menu
+        self._apply_hotkeys()
+        self.hotkeys.start()
+
         dpi = root.winfo_fpixels("1i") / 96.0
-        self.s = max(0.55, min(dpi, (root.winfo_screenheight() - 130 * dpi) / self.H))
+        self.s = max(0.5, min(dpi, (root.winfo_screenwidth() - 40) / self.W,
+                              (root.winfo_screenheight() - 130 * dpi) / self.H))
 
         root.title(APP_NAME)
         root.configure(bg=BG)
@@ -624,11 +784,9 @@ class RadioUI:
         pos = self.settings.get("position")
         if pos and re.fullmatch(r"\+-?\d+\+-?\d+", pos):
             root.geometry(pos)
-        else:
-            root.geometry(f"+{int(root.winfo_screenwidth() / 2 - self.S(self.W) / 2)}+{int(10 * dpi)}")
         self.c = tk.Canvas(root, width=self.S(self.W), height=self.S(self.H), bg=BG, highlightthickness=0)
         self.c.pack()
-        self._draw_static()
+        self._draw()
         self._bind()
 
         self._load_devices()
@@ -637,13 +795,75 @@ class RadioUI:
         except Exception as e:
             if not os.environ.get("PTT_SCREENSHOT"):
                 messagebox.showwarning(APP_NAME, f"Højttaleren kunne ikke åbnes:\n{e}")
-        self.hotkey.set(self.settings.get("hotkey", "F8" if self.hotkey.available else "Ingen"))
         root.attributes("-topmost", bool(self.settings.get("topmost", False)))
         root.protocol("WM_DELETE_WINDOW", self._quit)
 
-        if self.settings.get("autoconnect") and self.settings.get("host"):
-            self._power(True)
+        if not os.environ.get("PTT_SCREENSHOT"):
+            if self.settings.get("host"):
+                self._apply_power()
+            else:
+                root.after(300, self._open_menu)
         self._tick()
+
+    # ---------------------------------------------------------- indstillinger
+    def _migrate(self):
+        st = self.settings
+        nets = st.get("nets")
+        if not isinstance(nets, list) or len(nets) < NETS:
+            old_key = _LEGACY.get(st.get("hotkey", "F8"), "key:f8")
+            nets = [
+                {"active": True, "channel": int(st.get("channel", 0)), "hotkey": old_key or "key:f8",
+                 "muted": False, "host": ""},
+                {"active": False, "channel": 1, "hotkey": "key:f9", "muted": False, "host": ""},
+            ]
+            st["nets"] = nets
+
+    def _save(self):
+        for n in self.nets:
+            n.cfg["channel"] = n.core.channel
+            n.cfg["muted"] = n.port.muted
+        self.settings.update({
+            "mic": self.mic_var.get() if hasattr(self, "mic_var") else "Standard",
+            "speaker": self.spk_var.get() if hasattr(self, "spk_var") else "Standard",
+            "mode": self.nets[0].core.fx.mode,
+            "volume": self.volume,
+        })
+        save_settings(self.settings)
+
+    def _apply_hotkeys(self):
+        self.hotkeys.clear()
+        for n in self.nets:
+            self.hotkeys.bind(n.cfg.get("hotkey", ""), lambda n=n: self._ptt(n, True), lambda n=n: self._ptt(n, False))
+
+    def _apply_pan(self):
+        split = bool(self.settings.get("stereo", False))
+        self.nets[0].port.set_pan(-1 if split else 0)
+        self.nets[1].port.set_pan(1 if split else 0)
+
+    def _apply_volume(self):
+        self.audio.volume = (self.volume / 10.0) ** 1.6 if self.volume else 0.0
+
+    def _host_for(self, n):
+        return (n.cfg.get("host") or self.settings.get("host", "")).strip()
+
+    def _apply_power(self):
+        """Forbind aktive net (eller genforbind hvis adresse/navn er ændret) og afbryd inaktive."""
+        name = self.settings.get("name", "")
+        for i, n in enumerate(self.nets):
+            want = bool(n.cfg.get("active", i == 0)) and bool(self._host_for(n))
+            target = (self._host_for(n), name)
+            if want and (not n.core.want or getattr(n, "target", None) != target):
+                if n.core.want:
+                    n.core.disconnect()
+                n.target = target
+                n.core.connect(target[0], name + (f" ({i + 1})" if self._both_same_hub() else ""))
+            elif not want and n.core.want:
+                n.core.disconnect()
+        self._dirty.set()
+
+    def _both_same_hub(self):
+        a, b = self.nets
+        return a.cfg.get("active", True) and b.cfg.get("active", False) and self._host_for(a) == self._host_for(b)
 
     # ---------------------------------------------------------- tegnehjælpere
     def S(self, v):
@@ -666,232 +886,162 @@ class RadioUI:
         S = self.S
         return self.c.create_rectangle(S(x1), S(y1), S(x2), S(y2), **kw)
 
-    def oval(self, cx, cy, r, **kw):
-        S = self.S
-        return self.c.create_oval(S(cx - r), S(cy - r), S(cx + r), S(cy + r), **kw)
-
     def text(self, x, y, **kw):
         return self.c.create_text(self.S(x), self.S(y), **kw)
 
-    # ---------------------------------------------------------- statisk tegning
-    def _draw_static(self):
-        c = self.c
-        # antenne
-        self.rr(72, 6, 108, 200, 16, fill="#191a18", outline="#2c2e2a", width=2)
-        for y in range(30, 180, 12):
-            c.create_line(self.S(78), self.S(y), self.S(102), self.S(y), fill="#232522", width=max(1, int(self.S(2))))
-        self.rr(62, 150, 118, 205, 8, fill="#202220", outline="#30332e")
+    def button(self, tag, x1, y1, x2, y2, label, size=16, color=TXT, r=12):
+        shape = self.rr(x1, y1, x2, y2, r, fill=BTN, outline=BTN_EDGE, width=2, tags=(tag, "btn"))
+        t = self.text((x1 + x2) / 2, (y1 + y2) / 2, text=label, fill=color, font=self.UF(size, "bold"), tags=(tag, "btn"))
+        self.btns[tag] = (shape, t)
+        return shape, t
 
-        # topplade med knapper
-        self.rr(140, 100, 356, 205, 14, fill="#22241f", outline="#363a33", width=2)
-        self.ch_knob = self._knob(196, 138, 31, "CH", tag="chknob")
-        self.vol_knob = self._knob(306, 140, 25, "VOL", tag="volknob")
-        self.led = self.oval(252, 124, 6, fill="#3a2a2a", outline="#111")
-        self.text(252, 139, text="TX/RX", fill=MUTED, font=self.UF(8))
-
-        # krop
-        self.rr(38, 190, 362, 790, 38, fill=BODY, outline=BODY_EDGE, width=3)
-        self.rr(56, 208, 344, 774, 26, fill=FACE, outline="#30332c", width=1)
-        for x in (46, 354):  # gummilister
-            self.rr(x - 4, 240, x + 4, 740, 4, fill="#232520", outline="")
-
-        # side-PTT
-        self.ptt_shape = self.rr(10, 300, 44, 480, 12, fill="#1b1d19", outline="#3a3e36", width=2, tags="ptt")
-        for y in range(318, 466, 10):
-            c.create_line(self.S(17), self.S(y), self.S(37), self.S(y), fill="#2c2f29", width=max(1, int(self.S(2))), tags="ptt")
-        self.text(27, 390, text="PTT", angle=90, fill="#c9cbc2", font=self.UF(12, "bold"), tags="ptt")
-
-        # mærkat og højttalergitter
-        self.text(200, 228, text="TAC-PTT  R-1", fill="#9a9f94", font=self.UF(12, "bold"))
-        for row in range(5):
-            for col in range(16):
-                x = 95 + col * 14 + (7 if row % 2 else 0)
-                if x > 310:
-                    continue
-                self.oval(x, 250 + row * 12, 3, fill="#151613", outline="")
-
-        # LCD
-        self.rr(70, 320, 330, 482, 14, fill="#121311", outline="#3a3e36", width=2)
-        self.lcd = self.rect(84, 333, 316, 469, fill=LCD_OFF, outline="#0c0d0b", width=2)
-        self.bars = [self.rect(92 + i * 7, 352 - (i + 1) * 3.5, 97 + i * 7, 352, fill="", outline="") for i in range(4)]
-        self.lcd_txrx = self.text(140, 345, text="", font=self.F(13, "bold"), fill=LCD_INK)
-        self.lcd_mode = self.text(198, 345, text="", font=self.F(12, "bold"), fill=LCD_INK)
-        self.lcd_clock = self.text(282, 345, text="", font=self.F(12, "bold"), fill=LCD_INK)
-        self.lcd_line = self.c.create_line(self.S(88), self.S(357), self.S(312), self.S(357), fill=LCD_INK)
-        self.lcd_big = self.text(200, 386, text="", font=self.F(34, "bold"), fill=LCD_INK)
-        self.lcd_name = self.text(200, 420, text="", font=self.F(15, "bold"), fill=LCD_INK)
-        self.lcd_status = self.text(200, 448, text="", font=self.F(13, "bold"), fill=LCD_INK)
-        self.lvl = [self.rect(150 + i * 10, 441, 157 + i * 10, 455, fill="", outline="") for i in range(10)]
-
-        # tastatur
-        self.keys = {}
-        for r, row in enumerate(KEY_ROWS):
-            for col, name in enumerate(row):
-                x1 = 70 + col * 66
-                y1 = 500 + r * 66
-                tag = f"key_{name}"
-                shape = self.rr(x1, y1, x1 + 58, y1 + 56, 12, fill=KEY, outline="#4a4f46", width=2, tags=(tag, "key"))
-                label = KEY_LABEL.get(name, name)
-                size = 22 if len(label) == 1 else 12
-                self.text(x1 + 29, y1 + 28, text=label, fill=KEY_COLOR.get(name, KEY_TXT),
-                          font=self.UF(size, "bold"), tags=(tag, "key"))
-                self.keys[name] = shape
-
-    def _knob(self, cx, cy, r, label, tag):
-        self.oval(cx, cy, r + 4, fill="#141513", outline="", tags=tag)
-        self.oval(cx, cy, r, fill="#2c2e2a", outline="#474b43", width=2, tags=tag)
-        for i in range(20):
-            a = 2 * math.pi * i / 20
-            self.c.create_line(self.S(cx + (r - 6) * math.cos(a)), self.S(cy + (r - 6) * math.sin(a)),
-                               self.S(cx + r * math.cos(a)), self.S(cy + r * math.sin(a)),
-                               fill="#1a1b18", width=max(1, int(self.S(2))), tags=tag)
-        self.oval(cx, cy, r * 0.55, fill="#33362f", outline="#1d1e1b", tags=tag)
-        ptr = self.c.create_line(0, 0, 1, 1, fill="#f0f0e0", width=max(2, int(self.S(3))), capstyle="round", tags=tag)
-        self.text(cx, cy + r + 11, text=label, fill=MUTED, font=self.UF(9, "bold"))
-        return (cx, cy, r, ptr)
-
-    def _set_knob(self, knob, frac):
-        cx, cy, r, ptr = knob
-        a = math.radians(-225 + 270 * max(0.0, min(1.0, frac)))
-        S = self.S
-        self.c.coords(ptr, S(cx + r * 0.2 * math.cos(a)), S(cy + r * 0.2 * math.sin(a)),
-                      S(cx + (r - 8) * math.cos(a)), S(cy + (r - 8) * math.sin(a)))
+    # ---------------------------------------------------------- tegning (layout efter skitsen)
+    def _draw(self):
+        self.btns = {}
+        self.ui = []
+        self.rr(8, 8, self.W - 8, self.H - 8, 22, fill=BODY, outline=BODY_EDGE, width=3)
+        for i in range(NETS):
+            x0 = 30 + i * 420
+            u = {}
+            # display
+            self.rr(x0 - 4, 26, x0 + 404, 234, 12, fill="#121311", outline="#3a3e36", width=2, tags=f"lcd{i}")
+            u["lcd"] = self.rect(x0 + 6, 36, x0 + 394, 224, fill=LCD_OFF, outline="#0c0d0b", width=2, tags=f"lcd{i}")
+            u["net"] = self.text(x0 + 40, 52, text=f"NET {i + 1}", font=self.F(15, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["bars"] = [self.rect(x0 + 84 + k * 8, 60 - (k + 1) * 4, x0 + 90 + k * 8, 60, fill="", outline="", tags=f"lcd{i}")
+                         for k in range(4)]
+            u["txrx"] = self.text(x0 + 150, 52, text="", font=self.F(15, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["mode"] = self.text(x0 + 215, 52, text="", font=self.F(14, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["mute"] = self.text(x0 + 285, 52, text="", font=self.F(14, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["clock"] = self.text(x0 + 355, 52, text="", font=self.F(14, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["line"] = self.c.create_line(self.S(x0 + 14), self.S(68), self.S(x0 + 386), self.S(68), fill=LCD_INK, tags=f"lcd{i}")
+            u["big"] = self.text(x0 + 200, 112, text="", font=self.F(48, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["name"] = self.text(x0 + 200, 162, text="", font=self.F(22, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["status"] = self.text(x0 + 200, 200, text="", font=self.F(17, "bold"), fill=LCD_INK, tags=f"lcd{i}")
+            u["lvl"] = [self.rect(x0 + 160 + k * 16, 191, x0 + 172 + k * 16, 209, fill="", outline="", tags=f"lcd{i}")
+                        for k in range(12)]
+            # PTT
+            u["ptt"] = self.rr(x0, 252, x0 + 245, 432, 16, fill=BTN, outline=BTN_EDGE, width=3, tags=(f"ptt{i}",))
+            u["ptt_t"] = self.text(x0 + 122, 330, text=f"PTT {i + 1}", fill=TXT, font=self.UF(34, "bold"), tags=(f"ptt{i}",))
+            u["ptt_k"] = self.text(x0 + 122, 378, text="", fill=MUTED, font=self.UF(12), tags=(f"ptt{i}",))
+            # mute + kanal op/ned
+            u["mute_b"] = self.button(f"mute{i}", x0 + 268, 252, x0 + 400, 318, "MUTE", 16)
+            self.button(f"up{i}", x0 + 268, 332, x0 + 400, 380, "▲  KANAL", 14)
+            self.button(f"dn{i}", x0 + 268, 384, x0 + 400, 432, "▼  KANAL", 14)
+            self.ui.append(u)
+        # bund: indstillinger og lydstyrke
+        self.button("menu", 30, 452, 430, 500, "⚙  INDSTILLINGER", 16, AMBER)
+        self.button("vdn", 450, 452, 540, 500, "−", 26)
+        self.button("vup", 740, 452, 830, 500, "+", 26)
+        self.rr(550, 452, 730, 500, 10, fill="#1c1e1a", outline="#3a3e36", width=2, tags="vol")
+        self.text(590, 476, text="VOL", fill=MUTED, font=self.UF(14, "bold"), tags="vol")
+        self.vol_segs = [self.rect(620 + k * 10, 466, 627 + k * 10, 486, fill="", outline="#3a3e36", tags="vol")
+                         for k in range(10)]
 
     # ---------------------------------------------------------- input
     def _bind(self):
         c = self.c
-        c.tag_bind("ptt", "<ButtonPress-1>", lambda e: self._ptt(True))
-        c.tag_bind("ptt", "<ButtonRelease-1>", lambda e: self._ptt(False))
-        c.tag_bind("chknob", "<ButtonPress-1>", lambda e: self._knob_click(e, self.ch_knob, self._step_channel))
-        c.tag_bind("volknob", "<ButtonPress-1>", lambda e: self._knob_click(e, self.vol_knob, self._step_volume))
-        c.bind("<MouseWheel>", self._wheel)
+        for i, n in enumerate(self.nets):
+            c.tag_bind(f"ptt{i}", "<ButtonPress-1>", lambda e, n=n: self._ptt(n, True, mouse=True))
+            c.tag_bind(f"mute{i}", "<ButtonPress-1>", lambda e, n=n, i=i: self._press(f"mute{i}", lambda: self._toggle_mute(n)))
+            c.tag_bind(f"up{i}", "<ButtonPress-1>", lambda e, n=n, i=i: self._press(f"up{i}", lambda: self._step(n, 1)))
+            c.tag_bind(f"dn{i}", "<ButtonPress-1>", lambda e, n=n, i=i: self._press(f"dn{i}", lambda: self._step(n, -1)))
+            c.tag_bind(f"lcd{i}", "<ButtonPress-1>", lambda e, n=n: self._channel_menu(n, e))
+        c.tag_bind("menu", "<ButtonPress-1>", lambda e: self._press("menu", self._open_menu))
+        c.tag_bind("vdn", "<ButtonPress-1>", lambda e: self._press("vdn", lambda: self._step_volume(-1)))
+        c.tag_bind("vup", "<ButtonPress-1>", lambda e: self._press("vup", lambda: self._step_volume(1)))
+        c.bind("<ButtonRelease-1>", self._release)
+        c.bind("<MouseWheel>", lambda e: self._wheel(e, 1 if e.delta > 0 else -1))
         c.bind("<Button-4>", lambda e: self._wheel(e, 1))
         c.bind("<Button-5>", lambda e: self._wheel(e, -1))
-        for name in self.keys:
-            c.tag_bind(f"key_{name}", "<ButtonPress-1>", lambda e, n=name: self._key_down(n))
-        c.bind("<ButtonRelease-1>", lambda e: self._key_up())
+        self.root.bind("<Prior>", lambda e: self._step_volume(1))
+        self.root.bind("<Next>", lambda e: self._step_volume(-1))
 
-        r = self.root
-        r.bind("<KeyPress-space>", self._space_down)
-        r.bind("<KeyRelease-space>", self._space_up)
-        for d in "0123456789":
-            r.bind(d, lambda e, n=d: self._key(n))
-        r.bind("<Return>", lambda e: self._key("ENT"))
-        r.bind("<KP_Enter>", lambda e: self._key("ENT"))
-        r.bind("<BackSpace>", lambda e: self._key("CLR"))
-        r.bind("<Escape>", lambda e: self._key("CLR"))
-        r.bind("<Up>", lambda e: self._key("UP"))
-        r.bind("<Down>", lambda e: self._key("DN"))
-        r.bind("<Prior>", lambda e: self._step_volume(1))
-        r.bind("<Next>", lambda e: self._step_volume(-1))
+    def _press(self, tag, action):
+        shape = self.btns[tag][0]
+        self.c.itemconfigure(shape, fill=BTN_DOWN)
+        self._pressed = tag
+        action()
 
-    def _ptt(self, down):
-        self.last_activity = time.monotonic()
-        self.c.itemconfigure(self.ptt_shape, fill="#0f100e" if down else "#1b1d19")
-        (self.core.ptt_down if down else self.core.ptt_up)()
+    def _release(self, e):
+        if self._pressed:
+            self.c.itemconfigure(self.btns[self._pressed][0], fill=BTN)
+            self._pressed = None
+        for n in self.nets:
+            if getattr(n, "mouse_ptt", False):
+                self._ptt(n, False)
 
-    def _knob_click(self, e, knob, step):
-        step(-1 if e.x < self.S(knob[0]) else 1)
-
-    def _wheel(self, e, direction=None):
-        d = direction if direction is not None else (1 if e.delta > 0 else -1)
-        if e.x > self.S(255) and e.y < self.S(210):
+    def _wheel(self, e, d):
+        x, y = e.x / self.s, e.y / self.s
+        if y > 445:
             self._step_volume(d)
         else:
-            self._step_channel(d)
+            self._step(self.nets[0 if x < self.W / 2 else 1], d)
 
-    def _step_channel(self, d):
-        self.last_activity = time.monotonic()
-        self.entry = ""
-        self.core.change_channel(d)
+    def _ptt(self, n, down, mouse=False):
+        """Kan kaldes fra genvejstast-tråden."""
+        n.last_activity = time.monotonic()
+        if down:
+            if mouse:
+                n.mouse_ptt = True
+            if not n.core.want:
+                n.core._flash("NETTET ER SLUKKET")
+                self._dirty.set()
+                return
+            n.core.ptt_down()
+        else:
+            n.mouse_ptt = False
+            n.core.ptt_up()
+
+    def _toggle_mute(self, n):
+        n.port.muted = not n.port.muted
+        n.last_activity = time.monotonic()
+        n.core._flash("MUTE" if n.port.muted else "LYD TIL")
+        self._save()
+        self._dirty.set()
+
+    def _step(self, n, d):
+        n.last_activity = time.monotonic()
+        n.core.change_channel(d)
         self._save()
 
     def _step_volume(self, d):
-        self.last_activity = time.monotonic()
         self.volume = max(0, min(10, self.volume + d))
         self._apply_volume()
-        self.core._flash(f"VOL {self.volume}")
-        self._dirty.set()
         self._save()
-
-    def _apply_volume(self):
-        self.audio.volume = (self.volume / 10.0) ** 1.6 if self.volume else 0.0
-
-    def _key_down(self, name):
-        self._pressed_key = name
-        self.c.itemconfigure(self.keys[name], fill=KEY_DOWN)
-        self._key(name)
-
-    def _key_up(self):
-        if self._pressed_key:
-            self.c.itemconfigure(self.keys[self._pressed_key], fill=KEY)
-            self._pressed_key = None
-        if self.core.ptt_held and not self._space_held():
-            self._ptt(False)
-
-    def _space_held(self):
-        return bool(getattr(self, "_space_is_down", False))
-
-    def _key(self, name):
-        self.last_activity = time.monotonic()
-        if name.isdigit():
-            self.entry = (self.entry + name)[-2:]
-            self.entry_time = time.monotonic()
-        elif name == "ENT":
-            if self.entry:
-                n = int(self.entry)
-                self.entry = ""
-                if 1 <= n <= len(self.core.channel_names):
-                    self.core.set_channel(n - 1)
-                    self._save()
-                else:
-                    self.core._flash("UGYLDIG KANAL")
-        elif name == "CLR":
-            self.entry = ""
-        elif name == "UP":
-            self._step_channel(1)
-        elif name == "DN":
-            self._step_channel(-1)
-        elif name == "MENU":
-            self._open_menu()
-        elif name == "PWR":
-            self._power(not self.core.want)
         self._dirty.set()
 
-    def _typing(self):
-        return isinstance(self.root.focus_get(), tk.Entry)
+    def _channel_menu(self, n, e):
+        """Klik på displayet: vælg kanal direkte fra en liste, eller tænd/sluk nettet."""
+        m = tk.Menu(self.root, tearoff=0, bg="#1A1E20", fg=FG, activebackground="#3F7F55", activeforeground=FG,
+                    font=("Segoe UI", 10))
+        for i, name in enumerate(n.core.channel_names):
+            mark = "●  " if i == n.core.channel else "    "
+            m.add_command(label=f"{mark}CH {i + 1:02d}   {name}",
+                          command=lambda i=i: (n.core.set_channel(i), self._save()))
+        m.add_separator()
+        active = n.cfg.get("active", n.idx == 0)
+        m.add_command(label=("Sluk" if active else "Tænd") + f" net {n.idx + 1}",
+                      command=lambda: self._set_active(n, not active))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
-    def _space_down(self, e):
-        if self._release_job:
-            self.root.after_cancel(self._release_job)
-            self._release_job = None
-        if not self._space_held():
-            self._space_is_down = True
-            self._ptt(True)
-
-    def _space_up(self, e):
-        self._release_job = self.root.after(40, self._space_release)
-
-    def _space_release(self):
-        self._release_job = None
-        self._space_is_down = False
-        self._ptt(False)
-
-    # ---------------------------------------------------------- tænd/sluk og menu
-    def _power(self, on):
-        if not on:
-            self.core.disconnect()
-            self.settings["autoconnect"] = False
-            self._save()
-            return
-        host = self.settings.get("host", "").strip()
-        if not host:
+    def _set_active(self, n, on):
+        n.cfg["active"] = on
+        self._save()
+        if on and not self.settings.get("host"):
             self._open_menu()
             return
-        self.settings["autoconnect"] = True
-        self._save()
-        self.core.connect(host, self.settings.get("name", ""))
+        self._apply_power()
 
+    def _typing_in_menu(self):
+        try:
+            return bool(self.menu and self.menu.winfo_exists() and isinstance(self.root.focus_get(), tk.Entry))
+        except (tk.TclError, KeyError):
+            return False
+
+    # ---------------------------------------------------------- indstillingsvindue
     def _open_menu(self):
         if self.menu and self.menu.winfo_exists():
             self.menu.lift()
@@ -912,30 +1062,41 @@ class RadioUI:
         style.configure("TCombobox", fieldbackground="#1A1E20", background="#2A2D2E", foreground=FG)
         style.map("TCombobox", fieldbackground=[("readonly", "#1A1E20")], foreground=[("readonly", FG)])
 
-        def lbl(t, r):
-            tk.Label(m, text=t, bg=BG, fg=MUTED, font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", pady=4)
+        def lbl(t, r, col=0, head=False):
+            tk.Label(m, text=t, bg=BG, fg=FG if head else MUTED,
+                     font=("Segoe UI", 10, "bold") if head else ("Segoe UI", 9)).grid(
+                row=r, column=col, sticky="w", pady=(10 if head else 3, 3))
 
-        def entry(var, r):
+        def entry(var, r, width=26):
             e = tk.Entry(m, textvariable=var, bg="#1A1E20", fg=FG, insertbackground=FG, relief="flat",
-                         font=("Segoe UI", 11), width=26, highlightthickness=1,
+                         font=("Segoe UI", 11), width=width, highlightthickness=1,
                          highlightbackground="#2A2D2E", highlightcolor="#3F7F55")
-            e.grid(row=r, column=1, sticky="ew", padx=(10, 0), ipady=4)
+            e.grid(row=r, column=1, sticky="ew", padx=(10, 0), ipady=3)
             return e
 
-        def btn(parent, text, cmd):
+        def btn(parent, text, cmd=None):
             return tk.Button(parent, text=text, command=cmd, bg="#2A2D2E", fg=FG, activebackground="#3A3D3E",
                              activeforeground=FG, relief="flat", bd=0, padx=12, pady=5, font=("Segoe UI", 10))
 
+        def check(text, var, r, col=1):
+            tk.Checkbutton(m, text=text, variable=var, bg=BG, fg=FG, selectcolor="#1A1E20", activebackground=BG,
+                           activeforeground=FG, font=("Segoe UI", 9)).grid(row=r, column=col, sticky="w", padx=(6, 0))
+
         host = tk.StringVar(value=self.settings.get("host", ""))
         name = tk.StringVar(value=self.settings.get("name", ""))
-        mode = tk.StringVar(value=MODES.get(self.core.fx.mode))
-        hotkey = tk.StringVar(value=self.settings.get("hotkey", "F8" if self.hotkey.available else "Ingen"))
+        mode = tk.StringVar(value=MODES.get(self.nets[0].core.fx.mode))
         top = tk.BooleanVar(value=self.settings.get("topmost", False))
+        stereo = tk.BooleanVar(value=self.settings.get("stereo", False))
+        act = [tk.BooleanVar(value=n.cfg.get("active", n.idx == 0)) for n in self.nets]
+        nhost = [tk.StringVar(value=n.cfg.get("host", "")) for n in self.nets]
+        keys = [n.cfg.get("hotkey", "") for n in self.nets]
 
-        lbl("Hub-adresse", 0)
-        entry(host, 0)
-        find = btn(m, "Søg", None)
-        find.grid(row=0, column=2, padx=(6, 0))
+        r = 0
+        lbl("Fælles", r, head=True); r += 1
+        lbl("Hub-adresse", r)
+        entry(host, r)
+        find = btn(m, "Søg")
+        find.grid(row=r, column=2, padx=(6, 0)); r += 1
 
         def do_find():
             find.configure(state="disabled", text="…")
@@ -956,59 +1117,92 @@ class RadioUI:
             threading.Thread(target=work, daemon=True).start()
         find.configure(command=do_find)
 
-        lbl("Kaldenavn", 1)
-        entry(name, 1)
-        lbl("Radiolyd", 2)
+        lbl("Kaldenavn", r); entry(name, r); r += 1
+        lbl("Radiolyd", r)
         ttk.Combobox(m, textvariable=mode, values=list(MODES.values()), state="readonly").grid(
-            row=2, column=1, sticky="ew", padx=(10, 0))
-        lbl("Mikrofon", 3)
-        mic = ttk.Combobox(m, textvariable=self.mic_var, values=[n for _, n in self._ins], state="readonly")
-        mic.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0))
-        lbl("Højttaler", 4)
-        spk = ttk.Combobox(m, textvariable=self.spk_var, values=[n for _, n in self._outs], state="readonly")
-        spk.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(10, 0))
-        lbl("Genvejstast (PTT)", 5)
-        hk = ttk.Combobox(m, textvariable=hotkey, values=HOTKEYS, state="readonly")
-        hk.grid(row=5, column=1, sticky="ew", padx=(10, 0))
-        if not self.hotkey.available:
-            hk.configure(state="disabled")
-        tk.Checkbutton(m, text="Altid øverst", variable=top, bg=BG, fg=FG, selectcolor="#1A1E20",
-                       activebackground=BG, activeforeground=FG, font=("Segoe UI", 9)).grid(
-            row=6, column=1, sticky="w", padx=(6, 0), pady=4)
+            row=r, column=1, sticky="ew", padx=(10, 0)); r += 1
+        lbl("Mikrofon", r)
+        ttk.Combobox(m, textvariable=self.mic_var, values=[x for _, x in self._ins], state="readonly").grid(
+            row=r, column=1, columnspan=2, sticky="ew", padx=(10, 0)); r += 1
+        lbl("Højttaler", r)
+        ttk.Combobox(m, textvariable=self.spk_var, values=[x for _, x in self._outs], state="readonly").grid(
+            row=r, column=1, columnspan=2, sticky="ew", padx=(10, 0)); r += 1
+        check("Net 1 i venstre øre, net 2 i højre (stereo)", stereo, r); r += 1
+        check("Altid øverst", top, r); r += 1
 
-        tk.Label(m, text="PTT: side-knappen, mellemrum eller genvejstasten.  Kanal: knap, ▲▼, hjul\n"
-                         "eller tal + ENT.  Lydstyrke: VOL-knap eller Page Up/Down.  PWR: tænd/sluk.",
+        key_btns = []
+        for i in range(NETS):
+            lbl(f"Net {i + 1}", r, head=True)
+            check("Aktiv", act[i], r); r += 1
+            lbl("Hub (tom = fælles)", r); entry(nhost[i], r); r += 1
+            lbl("PTT-tast", r)
+            kb = btn(m, key_label(keys[i]))
+            kb.grid(row=r, column=1, sticky="ew", padx=(10, 0))
+            key_btns.append(kb)
+            r += 1
+
+        def capture(i):
+            if not self.hotkeys.available:
+                messagebox.showinfo(APP_NAME, "Genvejstaster kræver modulet pynput.", parent=m)
+                return
+            key_btns[i].configure(text="Tryk på en tast eller museknap…  (Esc = annullér)", bg="#5a4a1a")
+
+            def got(kid):
+                def apply():
+                    if not key_btns[i].winfo_exists():
+                        return
+                    if kid:
+                        other = 1 - i
+                        if kid == keys[other]:
+                            keys[other] = ""
+                            key_btns[other].configure(text=key_label(""))
+                        keys[i] = kid
+                    key_btns[i].configure(text=key_label(keys[i]), bg="#2A2D2E")
+                self.root.after(0, apply)
+            self.hotkeys.capture(got)
+
+        for i, kb in enumerate(key_btns):
+            kb.configure(command=lambda i=i: capture(i))
+
+        tk.Label(m, text="Tip: vælg en tast du ellers ikke bruger (fx F-taster, Scroll Lock eller musens side-knapper) –\n"
+                         "tasten virker også når vinduet er minimeret, men beholder sin normale funktion i andre programmer.\n"
+                         "Klik på et display for at vælge kanal direkte eller tænde/slukke nettet.",
                  bg=BG, fg="#5E6365", font=("Segoe UI", 8), justify="left").grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(8, 4))
+            row=r, column=0, columnspan=3, sticky="w", pady=(10, 4)); r += 1
 
         bar = tk.Frame(m, bg=BG)
-        bar.grid(row=8, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        bar.grid(row=r, column=0, columnspan=3, sticky="e", pady=(8, 0))
 
-        def save(connect):
-            old_host, old_name = self.settings.get("host", ""), self.settings.get("name", "")
+        def save():
+            self.hotkeys.capture_cb = None
             self.settings["host"] = host.get().strip()
             self.settings["name"] = name.get().strip()
-            self.settings["hotkey"] = hotkey.get()
             self.settings["topmost"] = bool(top.get())
+            self.settings["stereo"] = bool(stereo.get())
             inv = {v: k for k, v in MODES.items()}
-            self.core.fx.set_mode(inv.get(mode.get(), "digital"))
-            self.hotkey.set(hotkey.get())
+            for i, n in enumerate(self.nets):
+                n.cfg["active"] = bool(act[i].get())
+                n.cfg["host"] = nhost[i].get().strip()
+                n.cfg["hotkey"] = keys[i]
+                n.core.fx.set_mode(inv.get(mode.get(), "digital"))
+            self._apply_hotkeys()
+            self._apply_pan()
             self.root.attributes("-topmost", bool(top.get()))
             self._apply_devices()
             self._save()
             m.destroy()
-            changed = (old_host, old_name) != (self.settings["host"], self.settings["name"])
-            if connect and self.settings["host"] and (changed or not self.core.want):
-                if self.core.want:
-                    self.core.disconnect()
-                self._power(True)
+            self._apply_power()
 
-        btn(bar, "Annullér", m.destroy).pack(side="right", padx=(6, 0))
-        btn(bar, "Gem og tænd", lambda: save(True)).pack(side="right", padx=(6, 0))
-        btn(bar, "Gem", lambda: save(False)).pack(side="right")
+        def cancel():
+            self.hotkeys.capture_cb = None
+            m.destroy()
+
+        m.protocol("WM_DELETE_WINDOW", cancel)
+        btn(bar, "Annullér", cancel).pack(side="right", padx=(6, 0))
+        btn(bar, "Gem", save).pack(side="right")
         m.columnconfigure(1, weight=1)
 
-    # ---------------------------------------------------------- lydenheder og indstillinger
+    # ---------------------------------------------------------- lydenheder
     def _load_devices(self):
         try:
             ins, outs = self.audio.devices()
@@ -1016,8 +1210,8 @@ class RadioUI:
             ins, outs = [], []
         self._ins = [(None, "Standard")] + ins
         self._outs = [(None, "Standard")] + outs
-        names_in = [n for _, n in self._ins]
-        names_out = [n for _, n in self._outs]
+        names_in = [x for _, x in self._ins]
+        names_out = [x for _, x in self._outs]
         self.mic_var = tk.StringVar(value=self.settings.get("mic") if self.settings.get("mic") in names_in else "Standard")
         self.spk_var = tk.StringVar(value=self.settings.get("speaker") if self.settings.get("speaker") in names_out else "Standard")
         self.audio.in_dev = self._dev_index(self._ins, self.mic_var.get())
@@ -1025,8 +1219,8 @@ class RadioUI:
 
     @staticmethod
     def _dev_index(lst, name):
-        for i, n in lst:
-            if n == name:
+        for i, x in lst:
+            if x == name:
                 return i
         return None
 
@@ -1039,26 +1233,17 @@ class RadioUI:
         except Exception as e:
             messagebox.showwarning(APP_NAME, f"Lydenheden kunne ikke åbnes:\n{e}")
 
-    def _save(self):
-        self.settings.update({
-            "channel": self.core.channel,
-            "mic": self.mic_var.get() if hasattr(self, "mic_var") else "Standard",
-            "speaker": self.spk_var.get() if hasattr(self, "spk_var") else "Standard",
-            "mode": self.core.fx.mode,
-            "volume": self.volume,
-        })
-        save_settings(self.settings)
-
     def _quit(self):
         self.settings["position"] = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
         self._save()
-        self.hotkey.stop()
-        self.core.disconnect()
+        self.hotkeys.stop()
+        for n in self.nets:
+            n.core.disconnect()
         self.audio.stop_input()
         self.audio.stop_output()
         self.root.destroy()
 
-    # ---------------------------------------------------------- opdatering af display
+    # ---------------------------------------------------------- display
     def _tick(self):
         self._dirty.clear()
         try:
@@ -1068,113 +1253,106 @@ class RadioUI:
         self.root.after(80, self._tick)
 
     def _render(self):
-        c, core, now = self.c, self.core, time.monotonic()
-        with core.lock:
-            want, online, held, tx = core.want, core.online, core.ptt_held, core.transmitting
-            ch, names, status, rx = core.channel, list(core.channel_names), list(core.channel_status), core.receiving
-            msg, flash, lvl = core.status_msg, core.current_flash(), core.mic_level
-        if tx or rx:
-            self.last_activity = now
-        if self.entry and now - self.entry_time > 6:
-            self.entry = ""
+        c, now = self.c, time.monotonic()
+        clock = time.strftime("%H:%M")
+        titles = []
+        for i, n in enumerate(self.nets):
+            u, core = self.ui[i], n.core
+            with core.lock:
+                want, online, held, tx = core.want, core.online, core.ptt_held, core.transmitting
+                ch, names, status, rx = core.channel, list(core.channel_names), list(core.channel_status), core.receiving
+                flash, lvl = core.current_flash(), core.mic_level
+            muted = n.port.muted
+            if tx or rx:
+                n.last_activity = now
 
-        # knapper og LED
-        self._set_knob(self.ch_knob, ch / max(1, len(names) - 1))
-        self._set_knob(self.vol_knob, self.volume / 10)
-        c.itemconfigure(self.led, fill="#ff3030" if tx else "#30e050" if rx else "#3a2a2a")
+            bg = LCD_OFF if not want else LCD_ON if (now - n.last_activity < 8 or tx or rx) else LCD_DIM
+            ink = LCD_INK if want else LCD_OFF_INK
+            c.itemconfigure(u["lcd"], fill=bg)
+            for k in ("net", "txrx", "mode", "mute", "clock", "big", "name", "status"):
+                c.itemconfigure(u[k], fill=ink)
+            c.itemconfigure(u["line"], fill=ink)
 
-        # baggrundslys
-        if not want:
-            bg = LCD_OFF
-        elif now - self.last_activity < 8:
-            bg = LCD_ON
-        else:
-            bg = LCD_DIM
-        c.itemconfigure(self.lcd, fill=bg)
-        ink = LCD_INK if want else "#5a6a50"
-        for item in (self.lcd_txrx, self.lcd_mode, self.lcd_clock, self.lcd_big, self.lcd_name, self.lcd_status):
-            c.itemconfigure(item, fill=ink)
-        c.itemconfigure(self.lcd_line, fill=ink)
+            # PTT-knap og tast
+            c.itemconfigure(u["ptt"], fill="#b8202f" if tx else "#8a5a00" if held else BTN)
+            c.itemconfigure(u["ptt_k"], text=f"Tast: {key_label(n.cfg.get('hotkey', ''))}")
+            c.itemconfigure(u["mute_b"][0], fill="#6a5418" if muted else BTN)
+            c.itemconfigure(u["mute_b"][1], text="MUTE ●" if muted else "MUTE", fill=AMBER if muted else TXT)
 
-        if not want:
-            for b in self.bars:
-                c.itemconfigure(b, fill="")
-            for b in self.lvl:
-                c.itemconfigure(b, fill="")
-            c.itemconfigure(self.lcd_txrx, text="")
-            c.itemconfigure(self.lcd_mode, text="")
-            c.itemconfigure(self.lcd_clock, text="")
-            c.itemconfigure(self.lcd_big, text="OFF")
-            c.itemconfigure(self.lcd_name, text="TRYK PWR" if self.settings.get("host") else "TRYK MENU")
-            c.itemconfigure(self.lcd_status, text="")
-            self._title(f"{APP_NAME} – slukket")
-            return
+            if not want:
+                for b in u["bars"] + u["lvl"]:
+                    c.itemconfigure(b, fill="")
+                for k in ("txrx", "mode", "mute", "clock", "status"):
+                    c.itemconfigure(u[k], text="")
+                c.itemconfigure(u["big"], text="OFF")
+                c.itemconfigure(u["name"], text="KLIK FOR AT TÆNDE" if i else "SE INDSTILLINGER")
+                if flash:
+                    c.itemconfigure(u["status"], text=flash.upper()[:24])
+                continue
 
-        # topstatus
-        for i, b in enumerate(self.bars):
-            c.itemconfigure(b, fill=LCD_INK if online and (i < 4) else "")
-        c.itemconfigure(self.lcd_txrx, text="TX" if tx else "RX" if rx else "")
-        c.itemconfigure(self.lcd_mode, text={"digital": "DIG", "fm": "FM", "clear": "CLR"}[core.fx.mode])
-        c.itemconfigure(self.lcd_clock, text=time.strftime("%H:%M"))
+            for k, b in enumerate(u["bars"]):
+                c.itemconfigure(b, fill=LCD_INK if online else "")
+            c.itemconfigure(u["txrx"], text="TX" if tx else "RX" if rx else "")
+            c.itemconfigure(u["mode"], text={"digital": "DIG", "fm": "FM", "clear": "CLR"}[core.fx.mode])
+            c.itemconfigure(u["mute"], text="MUTE" if muted else "")
+            c.itemconfigure(u["clock"], text=clock)
+            c.itemconfigure(u["big"], text=f"CH {ch + 1:02d}")
+            name = names[ch] if ch < len(names) else f"Kanal {ch + 1}"
+            c.itemconfigure(u["name"], text=name.upper()[:18])
 
-        # kanal
-        if self.entry:
-            c.itemconfigure(self.lcd_big, text="CH " + self.entry.ljust(2, "_"))
-        else:
-            c.itemconfigure(self.lcd_big, text=f"CH {ch + 1:02d}")
-        name = names[ch] if ch < len(names) else f"Kanal {ch + 1}"
-        c.itemconfigure(self.lcd_name, text=name.upper()[:16])
+            here = status[ch] if ch < len(status) else {}
+            show_lvl = False
+            if not online:
+                line = "SØGER HUB" + "." * (int(now * 2) % 4)
+            elif flash:
+                line = flash.upper()[:24]
+            elif tx:
+                line, show_lvl = "TX", True
+            elif held:
+                line = "VENTER..."
+            elif rx:
+                line = f"RX {rx.upper()[:16]}"
+            elif here.get("talker"):
+                line = f"OPTAGET {here['talker'].upper()[:12]}"
+            else:
+                act = " ".join(str(k + 1) for k, s in enumerate(status) if k != ch and s.get("talker"))
+                line = f"{here.get('users', 0)} STN" + (f"  AKT {act}" if act else "")
+            if show_lvl:
+                c.coords(u["status"], self.S(30 + i * 420 + 120), self.S(200))
+                c.itemconfigure(u["status"], text="TX")
+                nl = min(12, int(lvl * 70 + 0.5))
+                for k, b in enumerate(u["lvl"]):
+                    c.itemconfigure(b, fill=LCD_INK if k < nl else "")
+            else:
+                c.coords(u["status"], self.S(30 + i * 420 + 200), self.S(200))
+                c.itemconfigure(u["status"], text=line)
+                for b in u["lvl"]:
+                    c.itemconfigure(b, fill="")
+            titles.append(f"{'● ' if tx else '◀ ' if rx else ''}N{i + 1} CH{ch + 1:02d}")
 
-        # statuslinje
-        here = status[ch] if ch < len(status) else {}
-        show_lvl = False
-        if not online:
-            line = "SØGER HUB" + "." * (int(now * 2) % 4)
-        elif flash:
-            line = flash.upper()[:22]
-        elif tx:
-            line, show_lvl = "TX", True
-        elif held:
-            line = "VENTER..."
-        elif rx:
-            line = f"RX {rx.upper()[:16]}"
-        elif here.get("talker"):
-            line = f"OPTAGET {here['talker'].upper()[:12]}"
-        else:
-            act = " ".join(str(i + 1) for i, s in enumerate(status) if i != ch and s.get("talker"))
-            line = f"{here.get('users', 0)} STN" + (f"  AKT {act}" if act else "")
-        if show_lvl:
-            c.itemconfigure(self.lcd_status, text="TX", )
-            c.coords(self.lcd_status, self.S(120), self.S(448))
-            n = min(10, int(lvl * 60 + 0.5))
-            for i, b in enumerate(self.lvl):
-                c.itemconfigure(b, fill=LCD_INK if i < n else "")
-        else:
-            c.coords(self.lcd_status, self.S(200), self.S(448))
-            c.itemconfigure(self.lcd_status, text=line)
-            for b in self.lvl:
-                c.itemconfigure(b, fill="")
-
-        self._title(f"{'● ' if tx else '◀ ' if rx else ''}CH{ch + 1:02d} {name} – {APP_NAME}")
-
-    def _title(self, t):
+        for k, seg in enumerate(self.vol_segs):
+            c.itemconfigure(seg, fill="#a9c98a" if k < self.volume else "")
+        t = (" | ".join(titles) + " – " if titles else "") + APP_NAME
         if self.root.title() != t:
             self.root.title(t)
 
 
 def _screenshot_mode(ui, path):
-    """Bruges af GitHub-bygningen til at tage et skærmbillede af interfacet."""
-    core = ui.core
+    """Bruges af GitHub-bygningen til at tage skærmbilleder af interfacet."""
 
     def setup():
-        core.want, core.online = True, True
-        core.status_msg = "Forbundet"
-        core.channel_names = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"]
-        core.channel = 2
-        core.channel_status = [{"users": 1, "talker": None}, {"users": 2, "talker": "Bo"},
-                               {"users": 3, "talker": "Anna"}] + [{"users": 0, "talker": None}] * 5
-        core.receiving = "Anna"
-        ui.last_activity = time.monotonic()
+        names = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel"]
+        a, b = ui.nets[0].core, ui.nets[1].core
+        for core in (a, b):
+            core.want, core.online = True, True
+            core.channel_names = names
+        a.channel, b.channel = 2, 4
+        a.channel_status = [{"users": 1, "talker": None}, {"users": 2, "talker": "Bo"},
+                            {"users": 3, "talker": "Anna"}] + [{"users": 0, "talker": None}] * 5
+        b.channel_status = [{"users": 0, "talker": None}] * 4 + [{"users": 2, "talker": None}] + [{"users": 0, "talker": None}] * 3
+        a.receiving = "Anna"
+        ui.nets[1].port.muted = True
+        ui.nets[0].last_activity = time.monotonic()
         ui.root.after(800, grab)
 
     def grab():
@@ -1191,6 +1369,7 @@ def _screenshot_mode(ui, path):
         m.update()
         x, y = m.winfo_rootx(), m.winfo_rooty()
         ImageGrab.grab((x, y, x + m.winfo_width(), y + m.winfo_height())).save(path.replace(".png", "_menu.png"))
+        ui.hotkeys.stop()
         ui.root.destroy()
 
     ui.root.after(1200, setup)
