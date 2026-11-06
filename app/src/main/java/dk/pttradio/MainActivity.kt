@@ -22,6 +22,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Spinner
@@ -76,6 +77,7 @@ class MainActivity : Activity(), RadioView.Listener {
         volumeControlStream = AudioManager.STREAM_MUSIC
         window.statusBarColor = Color.parseColor("#121412")
         window.navigationBarColor = Color.parseColor("#121412")
+        applyLockScreen()
         view = RadioView(this)
         view.listener = this
         setContentView(view)
@@ -90,7 +92,7 @@ class MainActivity : Activity(), RadioView.Listener {
 
     override fun onStop() {
         ui.removeCallbacks(ticker)
-        radio?.pttUp()          // send aldrig videre, når skærmen ikke er synlig
+        radio?.releaseScreenPtt()   // en sending startet fra skærmen må ikke fortsætte, når skærmen forsvinder
         view.releasePtt()
         radio?.onChange = null
         radio = null
@@ -171,6 +173,19 @@ class MainActivity : Activity(), RadioView.Listener {
     }
 
     // ---------------------------------------------------------------- display
+
+    /** Vis radioen oven på låseskærmen (så PTT kan bruges uden at låse telefonen op). */
+    @Suppress("DEPRECATION")
+    private fun applyLockScreen() {
+        val on = getSharedPreferences("ptt", MODE_PRIVATE).getBoolean("lockscreen", true)
+        if (Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(on)
+        } else if (on) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
+        }
+    }
 
     private fun volumeLevel(): Int {
         val v = am.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -285,7 +300,8 @@ class MainActivity : Activity(), RadioView.Listener {
         }
         val help = TextView(this).apply {
             text = "PTT: hold PTT-knappen eller lydstyrke ned.  Kanal: ▲▼, eller tryk på displayet for at " +
-                "vælge direkte og tænde/slukke.  Radioen lytter videre i baggrunden."
+                "vælge direkte og tænde/slukke.  Radioen lytter videre i baggrunden.\n\n" +
+                "Bluetooth-/headset-knap: hold inde for at tale, eller giv et kort klik for at starte og et klik mere for at stoppe."
             setTextColor(Color.parseColor("#8a8f86"))
             textSize = 11f
             setPadding(0, (14 * dp).toInt(), 0, 0)
@@ -296,6 +312,16 @@ class MainActivity : Activity(), RadioView.Listener {
         box.addView(name)
         box.addView(label("Radiolyd"))
         box.addView(mode)
+        val lock = CheckBox(this).apply {
+            text = "Vis radioen på låseskærmen"
+            isChecked = prefs.getBoolean("lockscreen", true)
+        }
+        val media = CheckBox(this).apply {
+            text = "Bluetooth-/headset-knap som PTT (også med slukket skærm)"
+            isChecked = prefs.getBoolean("mediaptt", true)
+        }
+        box.addView(lock)
+        box.addView(media)
         box.addView(help)
 
         find.setOnClickListener {
@@ -316,7 +342,10 @@ class MainActivity : Activity(), RadioView.Listener {
             val oldName = prefs.getString("name", "")
             val h = host.text.toString().trim()
             val n = name.text.toString().trim()
-            prefs.edit().putString("host", h).putString("name", n).apply()
+            prefs.edit().putString("host", h).putString("name", n)
+                .putBoolean("lockscreen", lock.isChecked).putBoolean("mediaptt", media.isChecked).apply()
+            applyLockScreen()
+            radio?.refreshMediaButton()
             radio?.setMode(modeKeys[mode.selectedItemPosition.coerceIn(0, modeKeys.size - 1)])
             return h != oldHost || n != oldName
         }

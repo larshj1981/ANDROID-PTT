@@ -87,11 +87,20 @@ Vælges under **MENU → Radiolyd** (hver bruger vælger selv, hvordan den modta
 
 Det er en lyd-efterligning på modtagesiden – ikke den rigtige MELPe-codec, og trafikken er uændret.
 
-## Baggrundsdrift på Android
+## Baggrundsdrift, låseskærm og Bluetooth-knap (Android)
 
-Når du forbinder, starter appen en baggrundstjeneste med en fast notifikation ("CH 03 · Kanal 3 – Lytter").
-Du hører kanalen med slukket skærm og når appen er lukket. Notifikationen viser hvem der taler,
-og har en **Afbryd**-knap. For at sende skal appen være åben (sikkerhedskrav i Android).
+- **Lytte:** når radioen er tændt, kører den som baggrundstjeneste med en fast notifikation
+  ("CH 03 · Kanal 3 – Lytter"). Du hører kanalen med slukket skærm, låst telefon og når appen er lukket.
+  Notifikationen viser hvem der taler og har en **Afbryd**-knap.
+- **Låseskærm:** radioen vises oven på låseskærmen (Indstillinger → "Vis radioen på låseskærmen"),
+  så du kan vække skærmen og trykke PTT uden at låse op. Bemærk: så kan alle med telefonen i hånden sende.
+- **Bluetooth-/headset-knap som PTT** (Indstillinger → slået til som standard) – virker også med slukket skærm:
+  - **Hold knappen inde** = send så længe den holdes.
+  - **Kort klik** = start sending, **klik igen** = stop (til knapper der kun sender ét klik).
+    Telefonen vibrerer to gange, når sendingen "låses". Hubben stopper alligevel efter 120 sek.
+  - Knappen skal sende et medieknap-signal (play/pause eller headset-knap) – det gør de fleste
+    Bluetooth-PTT-knapper og headset. Hvis en musik-app "stjæler" knappen, så luk den, eller start PTT Radio sidst.
+  - Mikrofonen er telefonens egen.
 
 Hvis lyden falder ud med slukket skærm: Indstillinger → Apps → PTT Radio → Batteri → **Ubegrænset**
 (især Samsung, Xiaomi, Huawei).

@@ -11,6 +11,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.media.ToneGenerator
 import android.net.wifi.WifiManager
 import android.os.Binder
@@ -21,6 +23,8 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.os.SystemClock
+import android.view.KeyEvent
 
 /**
  * Holder forbindelsen til hubben og lyden kørende, også når appen er i baggrunden
@@ -75,6 +79,14 @@ class RadioService : Service() {
     val fx = VoiceFx("digital")
     @Volatile var muted = false
         private set
+    /** Sendingen blev startet fra skærmen (og skal stoppes, hvis skærmen forsvinder). */
+    private var pttFromScreen = false
+
+    // Bluetooth-/headset-knap
+    private var session: MediaSession? = null
+    private var btDownAt = 0L
+    private var btLatched = false
+    private var btIgnoreUp = false
     val online: Boolean get() = client?.connected == true
 
     private var host = ""
@@ -117,6 +129,7 @@ class RadioService : Service() {
         audio.stopPlayback()
         tones?.release()
         releaseLocks()
+        releaseMediaButton()
         super.onDestroy()
     }
 
@@ -135,6 +148,7 @@ class RadioService : Service() {
         startForegroundService(Intent(this, RadioService::class.java))
         goForeground()
         acquireLocks()
+        setupMediaButton()
         startClient()
         changed()
     }
@@ -149,7 +163,9 @@ class RadioService : Service() {
         client?.close()
         client = null
         statusMsg = "Ikke forbundet"
+        btLatched = false
         releaseLocks()
+        releaseMediaButton()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         changed()
@@ -197,6 +213,8 @@ class RadioService : Service() {
             is HubEvent.Connected -> statusMsg = "Forbundet til $host"
             is HubEvent.Disconnected -> {
                 stopTx()
+                pttHeld = false
+                btLatched = false
                 receivingFrom = null
                 channelStatus = emptyList()
                 client = null
@@ -222,12 +240,14 @@ class RadioService : Service() {
                 tone(ToneGenerator.TONE_SUP_BUSY, 400)
                 vibrate(longArrayOf(0, 60, 80, 60))
                 flash("Optaget – ${e.talker} taler")
+                if (btLatched) { btLatched = false; pttUp() }
             }
             is HubEvent.RxStart -> receivingFrom = e.name
             is HubEvent.RxEnd -> {
                 if (transmitting) {
                     stopTx()
                     flash("Maks. sendetid nået")
+                    if (btLatched) { btLatched = false; pttUp() }
                 } else {
                     receivingFrom = null
                 }
@@ -240,7 +260,7 @@ class RadioService : Service() {
     // ---------------------------------------------------------------- PTT
 
     /** @return false hvis mikrofon-tilladelse mangler. */
-    fun pttDown(): Boolean {
+    fun pttDown(fromScreen: Boolean = true): Boolean {
         if (pttHeld) return true
         val c = client
         if (c == null || !c.connected) {
@@ -250,13 +270,20 @@ class RadioService : Service() {
         }
         if (!hasMic()) return false
         pttHeld = true
+        pttFromScreen = fromScreen
         c.send(HubClient.PTT_START)
         changed()
         return true
     }
 
+    /** Kaldes når skærmen forsvinder: stop kun en sending, der blev startet fra skærmen. */
+    fun releaseScreenPtt() {
+        if (pttHeld && pttFromScreen) pttUp()
+    }
+
     fun pttUp() {
         if (!pttHeld) return
+        btLatched = false
         pttHeld = false
         val wasTx = transmitting
         stopTx()
@@ -313,6 +340,82 @@ class RadioService : Service() {
         changed()
     }
 
+    // ---------------------------------------------------------------- Bluetooth-/headset-knap som PTT
+
+    /**
+     * Medieknappen (headset-knap, Bluetooth-PTT-knap, play/pause) bruges som PTT – også med slukket skærm.
+     * Holdes knappen inde, sendes der så længe den holdes. Et kort klik starter sendingen, næste klik stopper.
+     */
+    private fun setupMediaButton() {
+        if (!getSharedPreferences("ptt", MODE_PRIVATE).getBoolean("mediaptt", true)) {
+            releaseMediaButton()
+            return
+        }
+        if (session != null) return
+        val s = MediaSession(this, "PTTRadio")
+        s.setCallback(object : MediaSession.Callback() {
+            override fun onMediaButtonEvent(intent: Intent): Boolean {
+                @Suppress("DEPRECATION")
+                val ev = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT) ?: return false
+                return mediaKey(ev) || super.onMediaButtonEvent(intent)
+            }
+        }, ui)
+        s.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE)
+                .setState(PlaybackState.STATE_PLAYING, 0, 1f)
+                .build()
+        )
+        s.isActive = true
+        session = s
+    }
+
+    private fun releaseMediaButton() {
+        session?.let {
+            it.isActive = false
+            it.release()
+        }
+        session = null
+    }
+
+    fun refreshMediaButton() {
+        if (wantConnected) setupMediaButton() else releaseMediaButton()
+    }
+
+    private fun mediaKey(ev: KeyEvent): Boolean {
+        when (ev.keyCode) {
+            KeyEvent.KEYCODE_HEADSETHOOK, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> Unit
+            else -> return false
+        }
+        val now = SystemClock.uptimeMillis()
+        when (ev.action) {
+            KeyEvent.ACTION_DOWN -> {
+                if (ev.repeatCount > 0) return true
+                if (btLatched) {                       // andet klik: stop
+                    btLatched = false
+                    btIgnoreUp = true
+                    pttUp()
+                } else {
+                    btDownAt = now
+                    btIgnoreUp = false
+                    if (!pttDown(fromScreen = false)) flash("Mikrofon-adgang mangler")
+                }
+            }
+            KeyEvent.ACTION_UP -> {
+                if (btIgnoreUp) { btIgnoreUp = false; return true }
+                if (!pttHeld) return true
+                if (now - btDownAt < 350) {
+                    btLatched = true                   // kort klik: bliv ved med at sende
+                    vibrate(longArrayOf(0, 30, 60, 30))
+                } else {
+                    pttUp()                            // holdt inde: stop ved slip
+                }
+            }
+        }
+        return true
+    }
+
     // ---------------------------------------------------------------- notifikation
 
     private fun goForeground() {
@@ -338,7 +441,7 @@ class RadioService : Service() {
         val chName = channelNames.getOrElse(channel) { "Kanal ${channel + 1}" }
         val rx = receivingFrom
         val text = when {
-            transmitting -> "● Sender"
+            transmitting -> if (btLatched) "● Sender (klik på knappen for at stoppe)" else "● Sender"
             rx != null -> "◀ $rx taler"
             online -> "Lytter"
             else -> statusMsg
