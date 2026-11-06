@@ -10,37 +10,40 @@ import android.graphics.Typeface
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
-import kotlin.math.PI
-import kotlin.math.cos
 import kotlin.math.min
-import kotlin.math.sin
 
-/** Tegner en taktisk håndradio (samme design som Windows-klienten) og håndterer berøring. */
+/**
+ * Radioens skærm (layout efter skitsen):
+ *   display (kanal og navn) øverst · stor PTT til venstre · MUTE og kanal op/ned til højre
+ *   · indstillinger · lydstyrke op/ned nederst.
+ */
 class RadioView(ctx: Context) : View(ctx) {
 
     interface Listener {
         fun onPtt(down: Boolean)
-        fun onKey(name: String)
+        fun onMute()
         fun onChannelStep(d: Int)
         fun onVolumeStep(d: Int)
+        fun onSettings()
+        fun onDisplay()
     }
 
     data class State(
         val power: Boolean = false,
         val online: Boolean = false,
         val tx: Boolean = false,
-        val rx: Boolean = false,
+        val held: Boolean = false,
         val backlight: Int = 0,          // 0 slukket, 1 dæmpet, 2 tændt
         val txrx: String = "",
         val mode: String = "",
+        val muted: Boolean = false,
         val clock: String = "",
         val big: String = "OFF",
         val name: String = "",
         val status: String = "",
         val level: Float = 0f,
         val showLevel: Boolean = false,
-        val chFrac: Float = 0f,
-        val volFrac: Float = 0.5f,
+        val volume: Int = 5,             // 0–10
     )
 
     var listener: Listener? = null
@@ -52,24 +55,22 @@ class RadioView(ctx: Context) : View(ctx) {
     companion object {
         const val W = 400f
         const val H = 800f
-        val KEY_ROWS = listOf(
-            listOf("1", "2", "3", "UP"), listOf("4", "5", "6", "DN"),
-            listOf("7", "8", "9", "MENU"), listOf("CLR", "0", "ENT", "PWR")
-        )
-        val KEY_LABEL = mapOf("UP" to "▲", "DN" to "▼")
-        val KEY_COLOR = mapOf(
-            "MENU" to Color.parseColor("#e0b050"), "CLR" to Color.parseColor("#e0b050"),
-            "ENT" to Color.parseColor("#8fd08f"), "PWR" to Color.parseColor("#ff6a5a")
-        )
-        private val CH_KNOB = floatArrayOf(196f, 138f, 31f)
-        private val VOL_KNOB = floatArrayOf(306f, 140f, 25f)
-        private const val LCD_INK = 0xFF16200E.toInt()
+        private val DISPLAY = RectF(24f, 24f, 376f, 264f)
+        private val PTT = RectF(24f, 284f, 256f, 604f)
+        private val MUTE = RectF(272f, 284f, 376f, 392f)
+        private val UP = RectF(272f, 404f, 376f, 500f)
+        private val DOWN = RectF(272f, 508f, 376f, 604f)
+        private val SETTINGS = RectF(24f, 624f, 376f, 700f)
+        private val VDOWN = RectF(24f, 712f, 112f, 784f)
+        private val VBAR = RectF(120f, 712f, 280f, 784f)
+        private val VUP = RectF(288f, 712f, 376f, 784f)
+        private const val INK = 0xFF16200E.toInt()
     }
 
     private var sc = 1f
     private var ox = 0f
     private var oy = 0f
-    private var pressedKey: String? = null
+    private var pressed: String? = null
     private var pttPointer = -1
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -77,7 +78,7 @@ class RadioView(ctx: Context) : View(ctx) {
     private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val mono = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     private val sans = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-    private val r = RectF()
+    private val tmp = RectF()
 
     init {
         setBackgroundColor(Color.parseColor("#121412"))
@@ -90,16 +91,14 @@ class RadioView(ctx: Context) : View(ctx) {
         oy = (h - H * sc) / 2
     }
 
-    // ------------------------------------------------------------ tegning
-    private fun rr(x1: Float, y1: Float, x2: Float, y2: Float, rad: Float, c: Canvas, color: Int, edge: Int? = null, ew: Float = 2f) {
-        r.set(x1, y1, x2, y2)
+    private fun col(s: String) = Color.parseColor(s)
+
+    private fun box(c: Canvas, r: RectF, color: Int, edge: Int, rad: Float = 14f, ew: Float = 2f) {
         fill.color = color
         c.drawRoundRect(r, rad, rad, fill)
-        if (edge != null) {
-            stroke.color = edge
-            stroke.strokeWidth = ew
-            c.drawRoundRect(r, rad, rad, stroke)
-        }
+        stroke.color = edge
+        stroke.strokeWidth = ew
+        c.drawRoundRect(r, rad, rad, stroke)
     }
 
     private fun text(c: Canvas, s: String, x: Float, y: Float, size: Float, color: Int, tf: Typeface = sans) {
@@ -109,122 +108,89 @@ class RadioView(ctx: Context) : View(ctx) {
         c.drawText(s, x, y + size * 0.36f, txt)
     }
 
-    private fun col(s: String) = Color.parseColor(s)
+    private fun button(c: Canvas, id: String, r: RectF, label: String, size: Float, color: Int = col("#e8e8e0"),
+                       bg: Int = col("#3b3f38")) {
+        box(c, r, if (pressed == id) col("#1f221d") else bg, col("#4f554a"))
+        text(c, label, r.centerX(), r.centerY(), size, color)
+    }
 
     override fun onDraw(canvas: Canvas) {
         val st = state
-        canvas.save()
-        canvas.translate(ox, oy)
-        canvas.scale(sc, sc)
         val c = canvas
+        c.save()
+        c.translate(ox, oy)
+        c.scale(sc, sc)
 
-        // antenne
-        rr(72f, 6f, 108f, 200f, 16f, c, col("#191a18"), col("#2c2e2a"))
-        stroke.color = col("#232522"); stroke.strokeWidth = 2f
-        var y = 30f
-        while (y < 180f) { c.drawLine(78f, y, 102f, y, stroke); y += 12f }
-        rr(62f, 150f, 118f, 205f, 8f, c, col("#202220"), col("#30332e"), 1f)
+        tmp.set(8f, 8f, W - 8, H - 8)
+        box(c, tmp, col("#2b2e29"), col("#3d4239"), 26f, 3f)
 
-        // topplade
-        rr(140f, 100f, 356f, 205f, 14f, c, col("#22241f"), col("#363a33"))
-        knob(c, CH_KNOB, st.chFrac, "CH")
-        knob(c, VOL_KNOB, st.volFrac, "VOL")
-        fill.color = when { st.tx -> col("#ff3030"); st.rx -> col("#30e050"); else -> col("#3a2a2a") }
-        c.drawCircle(252f, 124f, 6f, fill)
-        text(c, "TX/RX", 252f, 139f, 8f, col("#8a8f86"))
-
-        // krop
-        rr(38f, 190f, 362f, 790f, 38f, c, col("#2b2e29"), col("#3d4239"), 3f)
-        rr(56f, 208f, 344f, 774f, 26f, c, col("#24261f"), col("#30332c"), 1f)
-        rr(42f, 240f, 50f, 740f, 4f, c, col("#232520"))
-        rr(350f, 240f, 358f, 740f, 4f, c, col("#232520"))
-
-        // side-PTT
-        rr(10f, 300f, 44f, 480f, 12f, c, if (pttPointer >= 0) col("#0f100e") else col("#1b1d19"), col("#3a3e36"))
-        stroke.color = col("#2c2f29"); stroke.strokeWidth = 2f
-        y = 318f
-        while (y < 466f) { c.drawLine(17f, y, 37f, y, stroke); y += 10f }
-        c.save(); c.rotate(-90f, 27f, 390f); text(c, "PTT", 27f, 390f, 12f, col("#c9cbc2")); c.restore()
-
-        // mærkat + gitter
-        text(c, "TAC-PTT  R-1", 200f, 228f, 12f, col("#9a9f94"))
-        fill.color = col("#151613")
-        for (row in 0 until 5) for (cl in 0 until 16) {
-            val x = 95f + cl * 14 + if (row % 2 == 1) 7 else 0
-            if (x <= 310f) c.drawCircle(x, 250f + row * 12, 3f, fill)
-        }
-
-        // LCD
-        rr(70f, 320f, 330f, 482f, 14f, c, col("#121311"), col("#3a3e36"))
+        // ---- display
+        tmp.set(DISPLAY.left - 4, DISPLAY.top - 4, DISPLAY.right + 4, DISPLAY.bottom + 4)
+        box(c, tmp, col("#121311"), col("#3a3e36"), 12f)
         fill.color = when (st.backlight) { 2 -> col("#a9c98a"); 1 -> col("#7c8f6a"); else -> col("#2f362b") }
-        c.drawRect(84f, 333f, 316f, 469f, fill)
-        stroke.color = col("#0c0d0b"); stroke.strokeWidth = 2f
-        c.drawRect(84f, 333f, 316f, 469f, stroke)
-        val ink = if (st.power) LCD_INK else col("#5a6a50")
+        c.drawRect(DISPLAY.left + 8, DISPLAY.top + 8, DISPLAY.right - 8, DISPLAY.bottom - 8, fill)
+        val ink = if (st.power) INK else col("#5a6a50")
         if (st.power) {
             fill.color = ink
-            if (st.online) for (i in 0 until 4) c.drawRect(92f + i * 7, 352f - (i + 1) * 3.5f, 97f + i * 7, 352f, fill)
-            text(c, st.txrx, 140f, 345f, 13f, ink, mono)
-            text(c, st.mode, 198f, 345f, 12f, ink, mono)
-            text(c, st.clock, 282f, 345f, 12f, ink, mono)
+            if (st.online) for (i in 0 until 4) c.drawRect(44f + i * 8, 54f - (i + 1) * 4, 50f + i * 8, 54f, fill)
+            text(c, st.txrx, 112f, 46f, 15f, ink, mono)
+            text(c, st.mode, 168f, 46f, 14f, ink, mono)
+            text(c, if (st.muted) "MUTE" else "", 236f, 46f, 14f, ink, mono)
+            text(c, st.clock, 330f, 46f, 14f, ink, mono)
         }
-        stroke.color = ink; stroke.strokeWidth = 1f
-        c.drawLine(88f, 357f, 312f, 357f, stroke)
-        text(c, st.big, 200f, 386f, 34f, ink, mono)
-        text(c, st.name, 200f, 420f, 15f, ink, mono)
+        stroke.color = ink; stroke.strokeWidth = 1.5f
+        c.drawLine(40f, 64f, 360f, 64f, stroke)
+        text(c, st.big, 200f, 118f, 52f, ink, mono)
+        text(c, st.name, 200f, 178f, 22f, ink, mono)
         if (st.showLevel) {
-            text(c, "TX", 120f, 448f, 13f, ink, mono)
-            val n = min(10, (st.level * 60 + 0.5f).toInt())
+            text(c, "TX", 110f, 226f, 17f, ink, mono)
+            val n = min(12, (st.level * 70 + 0.5f).toInt())
             fill.color = ink
-            for (i in 0 until n) c.drawRect(150f + i * 10, 441f, 157f + i * 10, 455f, fill)
+            for (i in 0 until n) c.drawRect(140f + i * 16, 216f, 152f + i * 16, 236f, fill)
         } else {
-            text(c, st.status, 200f, 448f, 13f, ink, mono)
+            text(c, st.status, 200f, 226f, 17f, ink, mono)
         }
 
-        // tastatur
-        for ((ri, row) in KEY_ROWS.withIndex()) for ((ci, name) in row.withIndex()) {
-            val x1 = 70f + ci * 66
-            val y1 = 500f + ri * 66
-            rr(x1, y1, x1 + 58, y1 + 56, 12f, c, if (pressedKey == name) col("#1f221d") else col("#3b3f38"), col("#4a4f46"))
-            val label = KEY_LABEL[name] ?: name
-            text(c, label, x1 + 29, y1 + 28, if (label.length == 1) 22f else 12f, KEY_COLOR[name] ?: col("#e8e8e0"))
-        }
-        canvas.restore()
-    }
+        // ---- PTT
+        val pttColor = when { st.tx -> col("#b8202f"); st.held -> col("#8a5a00"); else -> col("#3b3f38") }
+        box(c, PTT, if (pttPointer >= 0 && !st.tx && !st.held) col("#1f221d") else pttColor, col("#4f554a"), 18f, 3f)
+        text(c, "PTT", PTT.centerX(), PTT.centerY() - 12, 46f, col("#e8e8e0"))
+        text(c, when { st.tx -> "SENDER"; st.held -> "VENTER"; else -> "hold inde" }, PTT.centerX(), PTT.centerY() + 40, 15f, col("#b0b4aa"))
 
-    private fun knob(c: Canvas, k: FloatArray, frac: Float, label: String) {
-        val (cx, cy, rad) = Triple(k[0], k[1], k[2])
-        fill.color = col("#141513"); c.drawCircle(cx, cy, rad + 4, fill)
-        fill.color = col("#2c2e2a"); c.drawCircle(cx, cy, rad, fill)
-        stroke.color = col("#474b43"); stroke.strokeWidth = 2f; c.drawCircle(cx, cy, rad, stroke)
-        stroke.color = col("#1a1b18")
-        for (i in 0 until 20) {
-            val a = 2 * PI * i / 20
-            c.drawLine(cx + (rad - 6) * cos(a).toFloat(), cy + (rad - 6) * sin(a).toFloat(),
-                cx + rad * cos(a).toFloat(), cy + rad * sin(a).toFloat(), stroke)
+        // ---- mute og kanal
+        button(c, "mute", MUTE, if (st.muted) "MUTE ●" else "MUTE", 18f,
+            if (st.muted) col("#e0b050") else col("#e8e8e0"), if (st.muted) col("#6a5418") else col("#3b3f38"))
+        button(c, "up", UP, "▲", 30f)
+        text(c, "KANAL", UP.centerX(), UP.bottom - 14, 11f, col("#8a8f86"))
+        button(c, "down", DOWN, "▼", 30f)
+        text(c, "KANAL", DOWN.centerX(), DOWN.bottom - 14, 11f, col("#8a8f86"))
+
+        // ---- indstillinger og lydstyrke
+        button(c, "settings", SETTINGS, "⚙  INDSTILLINGER", 20f, col("#e0b050"))
+        button(c, "vdown", VDOWN, "−", 34f)
+        button(c, "vup", VUP, "+", 34f)
+        box(c, VBAR, col("#1c1e1a"), col("#3a3e36"), 10f)
+        text(c, "VOL", VBAR.left + 26, VBAR.centerY(), 14f, col("#8a8f86"))
+        for (i in 0 until 10) {
+            val x = VBAR.left + 50 + i * 10.5f
+            tmp.set(x, VBAR.centerY() - 12, x + 7, VBAR.centerY() + 12)
+            if (i < st.volume) { fill.color = col("#a9c98a"); c.drawRect(tmp, fill) }
+            stroke.color = col("#3a3e36"); stroke.strokeWidth = 1f; c.drawRect(tmp, stroke)
         }
-        fill.color = col("#33362f"); c.drawCircle(cx, cy, rad * 0.55f, fill)
-        val a = Math.toRadians(-225.0 + 270 * frac.coerceIn(0f, 1f))
-        stroke.color = col("#f0f0e0"); stroke.strokeWidth = 3f; stroke.strokeCap = Paint.Cap.ROUND
-        c.drawLine(cx + rad * 0.2f * cos(a).toFloat(), cy + rad * 0.2f * sin(a).toFloat(),
-            cx + (rad - 8) * cos(a).toFloat(), cy + (rad - 8) * sin(a).toFloat(), stroke)
-        stroke.strokeCap = Paint.Cap.BUTT
-        text(c, label, cx, cy + rad + 11, 9f, col("#8a8f86"))
+        c.restore()
     }
 
     // ------------------------------------------------------------ berøring
-    private fun hitKey(x: Float, y: Float): String? {
-        for ((ri, row) in KEY_ROWS.withIndex()) for ((ci, name) in row.withIndex()) {
-            val x1 = 70f + ci * 66
-            val y1 = 500f + ri * 66
-            if (x in (x1 - 4)..(x1 + 62) && y in (y1 - 4)..(y1 + 60)) return name
-        }
-        return null
-    }
-
-    private fun inKnob(x: Float, y: Float, k: FloatArray): Boolean {
-        val dx = x - k[0]; val dy = y - k[1]
-        return dx * dx + dy * dy <= (k[2] + 10) * (k[2] + 10)
+    private fun hit(x: Float, y: Float): String? = when {
+        PTT.contains(x, y) -> "ptt"
+        MUTE.contains(x, y) -> "mute"
+        UP.contains(x, y) -> "up"
+        DOWN.contains(x, y) -> "down"
+        SETTINGS.contains(x, y) -> "settings"
+        VDOWN.contains(x, y) -> "vdown"
+        VUP.contains(x, y) -> "vup"
+        DISPLAY.contains(x, y) -> "display"
+        else -> null
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -235,26 +201,23 @@ class RadioView(ctx: Context) : View(ctx) {
         val id = ev.getPointerId(idx)
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                when {
-                    x < 58f && y in 285f..495f -> {
-                        if (pttPointer < 0) {
-                            pttPointer = id
-                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                            listener?.onPtt(true)
-                        }
+                when (val h = hit(x, y)) {
+                    "ptt" -> if (pttPointer < 0) {
+                        pttPointer = id
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        listener?.onPtt(true)
                     }
-                    inKnob(x, y, CH_KNOB) -> {
-                        performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                        listener?.onChannelStep(if (x < CH_KNOB[0]) -1 else 1)
-                    }
-                    inKnob(x, y, VOL_KNOB) -> {
-                        performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                        listener?.onVolumeStep(if (x < VOL_KNOB[0]) -1 else 1)
-                    }
-                    else -> hitKey(x, y)?.let {
-                        pressedKey = it
+                    null -> Unit
+                    else -> {
+                        pressed = h
                         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                        listener?.onKey(it)
+                        when (h) {
+                            "mute" -> listener?.onMute()
+                            "up" -> listener?.onChannelStep(1)
+                            "down" -> listener?.onChannelStep(-1)
+                            "vdown" -> listener?.onVolumeStep(-1)
+                            "vup" -> listener?.onVolumeStep(1)
+                        }
                     }
                 }
                 invalidate()
@@ -264,12 +227,19 @@ class RadioView(ctx: Context) : View(ctx) {
                     pttPointer = -1
                     listener?.onPtt(false)
                 }
-                if (ev.actionMasked == MotionEvent.ACTION_UP) pressedKey = null
+                if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                    // indstillinger/display åbnes ved slip, så dialogen ikke "stjæler" berøringen
+                    when (pressed) {
+                        "settings" -> if (hit(x, y) == "settings") listener?.onSettings()
+                        "display" -> if (hit(x, y) == "display") listener?.onDisplay()
+                    }
+                    pressed = null
+                }
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
                 if (pttPointer >= 0) { pttPointer = -1; listener?.onPtt(false) }
-                pressedKey = null
+                pressed = null
                 invalidate()
             }
         }

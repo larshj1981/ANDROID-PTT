@@ -922,7 +922,7 @@ class RadioUI:
             # PTT
             u["ptt"] = self.rr(x0, 252, x0 + 245, 432, 16, fill=BTN, outline=BTN_EDGE, width=3, tags=(f"ptt{i}",))
             u["ptt_t"] = self.text(x0 + 122, 330, text=f"PTT {i + 1}", fill=TXT, font=self.UF(34, "bold"), tags=(f"ptt{i}",))
-            u["ptt_k"] = self.text(x0 + 122, 378, text="", fill=MUTED, font=self.UF(12), tags=(f"ptt{i}",))
+            u["ptt_k"] = self.text(x0 + 122, 378, text="", fill="#b0b4aa", font=self.UF(15), tags=(f"ptt{i}",))
             # mute + kanal op/ned
             u["mute_b"] = self.button(f"mute{i}", x0 + 268, 252, x0 + 400, 318, "MUTE", 16)
             self.button(f"up{i}", x0 + 268, 332, x0 + 400, 380, "▲  KANAL", 14)
@@ -1136,7 +1136,7 @@ class RadioUI:
             check("Aktiv", act[i], r); r += 1
             lbl("Hub (tom = fælles)", r); entry(nhost[i], r); r += 1
             lbl("PTT-tast", r)
-            kb = btn(m, key_label(keys[i]))
+            kb = btn(m, key_label(keys[i]) + "    (klik for at skifte)")
             kb.grid(row=r, column=1, sticky="ew", padx=(10, 0))
             key_btns.append(kb)
             r += 1
@@ -1155,9 +1155,9 @@ class RadioUI:
                         other = 1 - i
                         if kid == keys[other]:
                             keys[other] = ""
-                            key_btns[other].configure(text=key_label(""))
+                            key_btns[other].configure(text=key_label("") + "    (klik for at skifte)")
                         keys[i] = kid
-                    key_btns[i].configure(text=key_label(keys[i]), bg="#2A2D2E")
+                    key_btns[i].configure(text=key_label(keys[i]) + "    (klik for at skifte)", bg="#2A2D2E")
                 self.root.after(0, apply)
             self.hotkeys.capture(got)
 

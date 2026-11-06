@@ -46,8 +46,6 @@ class MainActivity : Activity(), RadioView.Listener {
     private lateinit var am: AudioManager
     private val ui = Handler(Looper.getMainLooper())
     private var radio: RadioService? = null
-    private var entry = ""
-    private var entryTime = 0L
     private var lastActivity = 0L
     private val clockFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
 
@@ -114,7 +112,6 @@ class MainActivity : Activity(), RadioView.Listener {
 
     override fun onChannelStep(d: Int) {
         touch()
-        entry = ""
         radio?.changeChannel(d)
     }
 
@@ -124,34 +121,39 @@ class MainActivity : Activity(), RadioView.Listener {
             AudioManager.STREAM_MUSIC,
             if (d > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, 0
         )
-        val v = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        radio?.flash("VOL ${(v * 10 + max / 2) / max}")
         updateUi()
     }
 
-    override fun onKey(name: String) {
+    override fun onMute() {
         touch()
-        val r = radio
-        when {
-            name.length == 1 && name[0].isDigit() -> {
-                entry = (entry + name).takeLast(2)
-                entryTime = System.currentTimeMillis()
-            }
-            name == "ENT" -> if (entry.isNotEmpty()) {
-                val n = entry.toInt()
-                entry = ""
-                if (r != null && !r.setChannel(n - 1)) r.flash("UGYLDIG KANAL")
-            }
-            name == "CLR" -> entry = ""
-            name == "UP" -> onChannelStep(1)
-            name == "DN" -> onChannelStep(-1)
-            name == "MENU" -> openMenu()
-            name == "PWR" -> if (r != null) {
-                if (r.wantConnected) r.disconnect() else powerOn(r)
-            }
+        radio?.toggleMute()
+    }
+
+    override fun onSettings() {
+        touch()
+        openMenu()
+    }
+
+    /** Tryk på displayet: vælg kanal direkte fra listen, eller tænd/sluk radioen. */
+    override fun onDisplay() {
+        touch()
+        val r = radio ?: return
+        if (!r.wantConnected) {
+            powerOn(r)
+            return
         }
-        updateUi()
+        val names = r.channelNames
+        val items = names.mapIndexed { i, n -> (if (i == r.channel) "●  " else "    ") + String.format("CH %02d   %s", i + 1, n) } +
+            "⏻  Sluk radioen"
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Vælg kanal")
+            .setItems(items.toTypedArray()) { _, which ->
+                val rr = radio ?: return@setItems
+                if (which < names.size) rr.setChannel(which) else rr.disconnect()
+                updateUi()
+            }
+            .setNegativeButton("Annullér", null)
+            .show()
     }
 
     private fun touch() {
@@ -170,48 +172,50 @@ class MainActivity : Activity(), RadioView.Listener {
 
     // ---------------------------------------------------------------- display
 
+    private fun volumeLevel(): Int {
+        val v = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        return (v * 10 + max / 2) / max
+    }
+
     private fun updateUi() {
         if (intent?.getBooleanExtra("demo", false) == true) {  // bruges kun til skærmbilleder i bygningen
             view.state = RadioView.State(
-                power = true, online = true, rx = true, backlight = 2, txrx = "RX", mode = "DIG",
-                clock = clockFmt.format(Date()), big = "CH 03", name = "CHARLIE", status = "RX ANNA",
-                chFrac = 2f / 7, volFrac = 0.7f
+                power = true, online = true, backlight = 2, txrx = "RX", mode = "DIG",
+                clock = clockFmt.format(Date()), big = "CH 03", name = "CHARLIE", status = "RX ANNA", volume = 7
             )
             return
         }
         val r = radio
         val now = System.currentTimeMillis()
-        if (entry.isNotEmpty() && now - entryTime > 6000) entry = ""
         val power = r?.wantConnected == true
         val online = r?.online == true
         val tx = r?.transmitting == true
         val held = r?.pttHeld == true
         val rx = r?.receivingFrom
+        val muted = r?.muted == true
         if (tx || rx != null) lastActivity = now
         val ch = r?.channel ?: 0
         val names = r?.channelNames ?: listOf("Kanal 1")
         val status = r?.channelStatus ?: emptyList()
-        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() /
-            am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        val chFrac = if (names.size > 1) ch.toFloat() / (names.size - 1) else 0f
 
         if (!power) {
             val hasHost = !getSharedPreferences("ptt", MODE_PRIVATE).getString("host", "").isNullOrBlank()
             view.state = RadioView.State(
-                big = "OFF", name = if (hasHost) "TRYK PWR" else "TRYK MENU",
-                chFrac = chFrac, volFrac = vol
+                big = "OFF", name = if (hasHost) "TRYK HER FOR AT TÆNDE" else "SE INDSTILLINGER",
+                muted = muted, volume = volumeLevel()
             )
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             return
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val name = names.getOrElse(ch) { "Kanal ${ch + 1}" }.uppercase().take(16)
+        val name = names.getOrElse(ch) { "Kanal ${ch + 1}" }.uppercase().take(18)
         val here = status.getOrNull(ch)
         val flash = r?.flashMsg
         val line = when {
             !online -> "SØGER HUB" + ".".repeat(((now / 500) % 4).toInt())
-            flash != null -> flash.uppercase().take(22)
+            flash != null -> flash.uppercase().take(24)
             tx -> ""
             held -> "VENTER..."
             rx != null -> "RX ${rx.uppercase().take(16)}"
@@ -226,18 +230,18 @@ class MainActivity : Activity(), RadioView.Listener {
             power = true,
             online = online,
             tx = tx,
-            rx = rx != null,
+            held = held && !tx,
             backlight = if (now - lastActivity < 8000) 2 else 1,
             txrx = if (tx) "TX" else if (rx != null) "RX" else "",
             mode = when (r?.fx?.mode) { "fm" -> "FM"; "clear" -> "CLR"; else -> "DIG" },
+            muted = muted,
             clock = clockFmt.format(Date(now)),
-            big = if (entry.isNotEmpty()) "CH " + entry.padEnd(2, '_') else String.format("CH %02d", ch + 1),
+            big = String.format("CH %02d", ch + 1),
             name = name,
             status = line,
             level = r?.micLevel ?: 0f,
             showLevel = tx && flash == null,
-            chFrac = chFrac,
-            volFrac = vol,
+            volume = volumeLevel(),
         )
     }
 
@@ -280,8 +284,8 @@ class MainActivity : Activity(), RadioView.Listener {
             setSelection(modeKeys.indexOf(radio?.fx?.mode ?: prefs.getString("mode", "digital")).coerceAtLeast(0))
         }
         val help = TextView(this).apply {
-            text = "PTT: side-knappen eller lydstyrke ned.  Kanal: CH-knap, ▲▼ eller tal + ENT.  " +
-                "Lydstyrke: VOL-knap.  PWR: tænd/sluk.  Radioen lytter videre i baggrunden."
+            text = "PTT: hold PTT-knappen eller lydstyrke ned.  Kanal: ▲▼, eller tryk på displayet for at " +
+                "vælge direkte og tænde/slukke.  Radioen lytter videre i baggrunden."
             setTextColor(Color.parseColor("#8a8f86"))
             textSize = 11f
             setPadding(0, (14 * dp).toInt(), 0, 0)

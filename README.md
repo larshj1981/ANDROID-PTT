@@ -37,29 +37,44 @@ python3 hub/hub.py --channels "Drift,Lager,Kontor,Fritid" --name "Firma-hub"
 
 ## 3. Brug
 
-1. Tryk **MENU**, tryk **Søg** (eller skriv hubbens adresse, fx `192.168.1.10` – står i PTTHub-vinduet).
-2. Skriv dit kaldenavn og tryk **Gem og tænd**.
+1. Åbn **Indstillinger**, tryk **Søg** (eller skriv hubbens adresse, fx `192.168.1.10` – står i PTTHub-vinduet).
+2. Skriv dit kaldenavn og tryk **Gem** (Windows) / **Gem og tænd** (Android).
 3. Vælg kanal og **hold PTT inde** for at tale. Se "Betjening" herunder.
 
 Kører hub og radio på samme Windows-pc, så skriv `127.0.0.1` som hub-adresse.
 
-## Betjening (Android og Windows)
+## Betjening
 
-Begge apps ligner en taktisk håndradio:
+### Windows – to net samtidigt
 
-| Del | Funktion |
-|---|---|
-| **PTT** (knappen på venstre side) | Hold inde for at tale. Android: også lydstyrke ned. Windows: også mellemrum eller genvejstasten (F8). |
-| **CH-knap** | Tryk på venstre/højre halvdel for forrige/næste kanal (Windows: også musehjul). |
-| **VOL-knap** | Lydstyrke ned/op (Windows: også musehjul eller Page Up/Down). |
-| **Tal + ENT** | Gå direkte til en kanal, fx `1` `2` `ENT` = kanal 12. **CLR** annullerer. |
-| **▲ ▼** | Forrige/næste kanal. |
-| **PWR** | Tænd/sluk (forbind/afbryd). |
-| **MENU** | Hub-adresse, Søg, kaldenavn, radiolyd (og på Windows: mikrofon, højttaler, genvejstast). |
+```
+┌──────────────────────┐ ┌──────────────────────┐
+│ NET 1  CH 03 CHARLIE │ │ NET 2  CH 05 ECHO    │   ← klik: vælg kanal / tænd-sluk net
+└──────────────────────┘ └──────────────────────┘
+┌──────────┐ ┌────────┐  ┌──────────┐ ┌────────┐
+│          │ │  MUTE  │  │          │ │  MUTE  │
+│  PTT 1   │ ├────────┤  │  PTT 2   │ ├────────┤
+│          │ │ ▲ / ▼  │  │          │ │ ▲ / ▼  │
+└──────────┘ └────────┘  └──────────┘ └────────┘
+[ ⚙ INDSTILLINGER       ] [ − ]  VOL ▮▮▮▮▮  [ + ]
+```
 
-Displayet viser signal, TX/RX, lydtilstand, ur, kanal, kanalnavn og hvem der taler
+- Hvert net har sin egen forbindelse, kanal, PTT og mute. Du kan lytte på begge og sende på ét eller begge på én gang.
+- **PTT-tast pr. net:** Indstillinger → Net 1/Net 2 → PTT-tast → klik og tryk på **en hvilken som helst tast eller museknap**
+  (fx F-taster, Scroll Lock, musens side-knapper). Virker også når vinduet er minimeret.
+  Vælg en tast du ellers ikke bruger – den beholder sin normale funktion i andre programmer.
+- **Net 2** slås til under Indstillinger (Aktiv) eller ved at klikke på dets display.
+  Begge net kan bruge den fælles hub eller hver sin hub.
+- **Stereo:** valgfrit net 1 i venstre øre og net 2 i højre (godt med headset).
+- Musehjul over et display skifter kanal, over lydstyrken ændrer det lydstyrken. Page Up/Down = lydstyrke.
+
+### Android
+
+Display øverst (tryk: vælg kanal direkte eller sluk), stor **PTT**, **MUTE**, **kanal ▲/▼**,
+**Indstillinger** og **lydstyrke −/+**. Lydstyrke ned-knappen på telefonen virker også som PTT.
+
+Displayet viser signal, TX/RX, lydtilstand, MUTE, ur, kanal, kanalnavn og hvem der taler
 (`RX ANNA`, `OPTAGET BO`, `3 STN  AKT 2 5` = 3 stationer på kanalen, aktivitet på kanal 2 og 5).
-LED'en er rød når du sender, grøn når du modtager.
 
 ## Radiolyd
 

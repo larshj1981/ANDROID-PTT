@@ -73,6 +73,8 @@ class RadioService : Service() {
     @Volatile var micLevel = 0f
         private set
     val fx = VoiceFx("digital")
+    @Volatile var muted = false
+        private set
     val online: Boolean get() = client?.connected == true
 
     private var host = ""
@@ -89,6 +91,7 @@ class RadioService : Service() {
         val prefs = getSharedPreferences("ptt", MODE_PRIVATE)
         channel = prefs.getInt("channel", 0)
         fx.setMode(prefs.getString("mode", "digital") ?: "digital")
+        muted = prefs.getBoolean("muted", false)
         tones = try { ToneGenerator(AudioManager.STREAM_MUSIC, 70) } catch (_: Exception) { null }
         audio.startPlayback()
         val nm = getSystemService(NotificationManager::class.java)
@@ -164,17 +167,23 @@ class RadioService : Service() {
         if (c !== client) return
         when (e) {
             is HubEvent.Audio -> {
-                if (!transmitting) {
+                if (!transmitting && !muted) {
                     val out = fx.process(e.data)
                     if (out.isNotEmpty()) audio.play(out)
                 }
                 return
             }
-            is HubEvent.RxStart -> if (!transmitting) audio.play(fx.startSound())
-            is HubEvent.RxEnd -> if (!transmitting) audio.play(fx.endSound())
+            is HubEvent.RxStart -> if (!transmitting && !muted) audio.play(fx.startSound())
+            is HubEvent.RxEnd -> if (!transmitting && !muted) audio.play(fx.endSound())
             else -> Unit
         }
         ui.post { if (c === client) handle(e) }
+    }
+
+    fun toggleMute() {
+        muted = !muted
+        getSharedPreferences("ptt", MODE_PRIVATE).edit().putBoolean("muted", muted).apply()
+        flash(if (muted) "MUTE" else "LYD TIL")
     }
 
     fun setMode(m: String) {
