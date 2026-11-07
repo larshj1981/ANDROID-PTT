@@ -128,22 +128,36 @@ jobs:
             echo BEGIN-android_on.png; base64 -w 4000 on.png; echo END-android_on.png
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Laver automatisk en Release, når VERSION har fået et nyt nummer på main (eller ved et tag vX.Y.Z).
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [version, android, windows, hub-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Findes versionen allerede?
+        id: chk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ needs.version.outputs.v }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v${{ needs.version.outputs.v }} findes allerede – springer over"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.chk.outputs.skip != '1'
+        uses: actions/download-artifact@v4
         with:
           path: dl
           merge-multiple: true
-      - run: ls -la dl
-      - uses: softprops/action-gh-release@v2
+      - if: steps.chk.outputs.skip != '1'
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.version.outputs.v }}
+          target_commitish: ${{ github.sha }}
           name: PTT Radio ${{ needs.version.outputs.v }}
           body_path: RELEASE_NOTES.md
+          make_latest: true
           files: |
             dl/PTTRadio-Android-${{ needs.version.outputs.v }}.apk
             dl/PTTRadio-Windows-${{ needs.version.outputs.v }}.exe

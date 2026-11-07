@@ -56,8 +56,9 @@ Hubben logger blandt andet hvem der forbinder (enhed og version), hvem der taler
 
 ## Bygge selv
 
-GitHub Actions bygger alt ved hvert push (fanen **Actions**). Et tag `vX.Y.Z` laver en Release med filerne.
-Ny version: ret `VERSION` og `VERSION = "…"` i `hub/hub.py` og `windows/pttradio_win.py`, push, og push et tag.
+GitHub Actions bygger og tester alt ved hvert push (fanen **Actions**).
+Ny version: ret `VERSION`, `VERSION = "…"` i `hub/hub.py` og `windows/pttradio_win.py` samt `RELEASE_NOTES.md`, og push til main –
+så laves en ny Release (fx `v3.1.0`) automatisk med filerne.
 
 ## 3. Brug
 
