@@ -44,8 +44,33 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 DEFAULT_PORT = 50000
 DISCOVERY_PORT = 50001
 APP_NAME = "PTT Radio"
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 log = logging.getLogger("pttradio")
+
+
+def parse_address(text):
+    """Gør hub-adressen tolerant: 'http://192.168.1.71:8080/' -> ('192.168.1.71', 50000).
+    Fjerner http://, sti og mellemrum, retter komma til punktum, og bruger radio-porten,
+    hvis man har skrevet webinterfacets port (8080)."""
+    raw = (text or "").strip()
+    notes = []
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw)
+    if m:
+        raw = raw[m.end():]
+        notes.append("webadresse-præfiks fjernet")
+    raw = raw.split("/", 1)[0].split("?", 1)[0].replace(" ", "")
+    if re.fullmatch(r"\d{1,3}(,\d{1,3}){3}(:\d+)?", raw):
+        raw = raw.replace(",", ".")
+        notes.append("komma rettet til punktum")
+    host, port = raw, DEFAULT_PORT
+    if raw.count(":") == 1:
+        h, p = raw.rsplit(":", 1)
+        if p.isdigit():
+            host, port = h, int(p)
+    if port == 8080:
+        port = DEFAULT_PORT
+        notes.append("8080 er webinterfacets port – bruger radio-porten 50000")
+    return host.strip("."), port, ", ".join(notes)
 
 
 def connect_error(e):
@@ -313,12 +338,9 @@ class RadioCore:
 
     # --- forbindelse
     def connect(self, host_port, name):
-        raw = host_port.strip()
-        host, port = raw, DEFAULT_PORT
-        if raw.count(":") == 1:
-            h, p = raw.rsplit(":", 1)
-            if p.isdigit():
-                host, port = h, int(p)
+        host, port, note = parse_address(host_port)
+        if note:
+            log.info("%s: adressen '%s' tolket som %s:%s (%s)", self.tag, host_port.strip(), host, port, note)
         with self.lock:
             self._gen += 1
             gen = self._gen

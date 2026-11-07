@@ -145,10 +145,9 @@ class RadioService : Service() {
     // ---------------------------------------------------------------- forbindelse
 
     fun connect(hostPort: String, userName: String) {
-        val raw = hostPort.trim()
-        val idx = raw.lastIndexOf(':')
-        host = if (idx > 0) raw.substring(0, idx) else raw
-        port = if (idx > 0) raw.substring(idx + 1).toIntOrNull() ?: DEFAULT_PORT else DEFAULT_PORT
+        val (h, p) = parseAddress(hostPort)
+        host = h
+        port = p
         name = userName.trim().ifEmpty { Build.MODEL }
         wantConnected = true
         statusMsg = "Forbinder…"
@@ -162,6 +161,21 @@ class RadioService : Service() {
         setupMediaButton()
         startClient()
         changed()
+    }
+
+    /** Tolerant hub-adresse: "http://192.168.1.71:8080/" -> ("192.168.1.71", 50000). */
+    private fun parseAddress(text: String): Pair<String, Int> {
+        var raw = text.trim().replace(Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://"), "")
+        raw = raw.substringBefore('/').substringBefore('?').replace(" ", "")
+        if (Regex("""\d{1,3}(,\d{1,3}){3}(:\d+)?""").matches(raw)) raw = raw.replace(',', '.')
+        var h = raw
+        var p = DEFAULT_PORT
+        val idx = raw.lastIndexOf(':')
+        if (idx > 0 && raw.count { it == ':' } == 1) {
+            raw.substring(idx + 1).toIntOrNull()?.let { h = raw.substring(0, idx); p = it }
+        }
+        if (p == 8080) p = DEFAULT_PORT   // webinterfacets port – radioen bruger 50000
+        return h.trim('.') to p
     }
 
     fun disconnect() {

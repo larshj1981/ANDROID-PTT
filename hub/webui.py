@@ -382,7 +382,7 @@ height:60vh;overflow:auto;padding:8px;white-space:pre-wrap;word-break:break-word
   <section id="t-status">
     <div class="card">
       <div class="lcdrow">
-        <div class="lcd"><small>HUB-ADRESSE</small><b id="addr">–</b></div>
+        <div class="lcd"><small>SKRIV I APPEN SOM HUB-ADRESSE</small><b id="addr">–</b></div>
         <div class="lcd"><small>FORBUNDET</small><b id="ncl">0</b></div>
         <div class="lcd"><small>TALER NU</small><b id="ntalk">0</b></div>
         <div class="lcd"><small>OPPETID</small><b id="up">–</b></div>

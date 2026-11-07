@@ -2,27 +2,27 @@
 
 Tre dele, der alle taler samme protokol og har samme versionsnummer (se `VERSION`):
 
-- **Hub** (`hub/`) – relæstationen. Windows: `PTTHub-3.0.0.exe` med ikon i proceslinjen og webinterface.
+- **Hub** (`hub/`) – relæstationen. Windows: `PTTHub-3.0.1.exe` med ikon i proceslinjen og webinterface.
   Linux/Raspberry Pi: `hub.py` som systemd-tjeneste.
-- **Android** (`app/`) – `PTTRadio-Android-3.0.0.apk` (Android 8+). Lytter i baggrunden, PTT fra låseskærm og Bluetooth-knap.
-- **Windows-klient** (`windows/`) – `PTTRadio-Windows-3.0.0.exe` (Windows 10/11). To net samtidigt.
+- **Android** (`app/`) – `PTTRadio-Android-3.0.1.apk` (Android 8+). Lytter i baggrunden, PTT fra låseskærm og Bluetooth-knap.
+- **Windows-klient** (`windows/`) – `PTTRadio-Windows-3.0.1.exe` (Windows 10/11). To net samtidigt.
 
 ## 1. Hent filerne
 
-Den nyeste udgave ligger under **Releases** på GitHub-siden (højre side → "PTT Radio 3.0.0").
+Den nyeste udgave ligger under **Releases** på GitHub-siden (højre side → "PTT Radio 3.0.1").
 Hver version får sit eget nummer i filnavnet. Udviklingsbygninger findes under **Actions**.
 
 Windows SmartScreen advarer første gang, fordi filerne ikke er signeret: "Flere oplysninger" → "Kør alligevel".
 
 ## 2. Start hubben
 
-**Windows:** kør `PTTHub-3.0.0.exe`. Den lægger sig som et lille radio-ikon ved uret og starter fremover selv ved login.
+**Windows:** kør `PTTHub-3.0.1.exe`. Den lægger sig som et lille radio-ikon ved uret og starter fremover selv ved login.
 Første gang åbner webinterfacet i browseren, hvor du vælger en adgangskode. Tryk **Tillad**, når Windows Firewall spørger.
 
 Højreklik på ikonet: **Åbn webinterface**, **Åbn log-mappe**, **Start ved login** (til/fra), **Genstart netværk**, **Afslut**.
 Ikonet er grønt når hubben kører, rødt ved fejl, og har en orange prik når nogen taler.
 
-**Linux / Raspberry Pi:** se `INSTALL-LINUX.txt` i `PTTHub-3.0.0-Linux.zip` (kort: `python3 hub.py --no-tray`).
+**Linux / Raspberry Pi:** se `INSTALL-LINUX.txt` i `PTTHub-3.0.1-Linux.zip` (kort: `python3 hub.py --no-tray`).
 
 Åbn TCP-port **50000**, UDP-port **50001** og TCP-port **8080** (webinterface) i firewallen på hub-maskinen.
 
