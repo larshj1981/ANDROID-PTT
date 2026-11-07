@@ -1,0 +1,15 @@
+# PTT Hub som systemd-tjeneste (Linux / Raspberry Pi) – se INSTALL-LINUX.txt
+[Unit]
+Description=PTT Hub (relæstation for PTT Radio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ptthub
+ExecStart=/usr/bin/python3 /opt/ptthub/hub.py --no-tray --data-dir /var/lib/ptthub
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

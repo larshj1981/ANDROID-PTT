@@ -76,6 +76,15 @@ class RadioService : Service() {
         private set
     @Volatile var micLevel = 0f
         private set
+    /** Kort årsag til at forbindelsen fejler (vises på displayet), fx "HUB SVARER IKKE". */
+    var lastError: String? = null
+        private set
+    /** Hvorfor radioen blev slukket af hubben (fx smidt af). */
+    var offReason: String? = null
+        private set
+    val appVersion: String by lazy {
+        try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
+    }
     val fx = VoiceFx("digital")
     @Volatile var muted = false
         private set
@@ -143,6 +152,8 @@ class RadioService : Service() {
         name = userName.trim().ifEmpty { Build.MODEL }
         wantConnected = true
         statusMsg = "Forbinder…"
+        lastError = null
+        offReason = null
 
         // Gør tjenesten "startet" og forgrund, så den overlever at appen lukkes
         startForegroundService(Intent(this, RadioService::class.java))
@@ -175,7 +186,7 @@ class RadioService : Service() {
         client?.close()
         val c = HubClient(::onHubEvent)
         client = c
-        c.connect(host, port, name, channel)
+        c.connect(host, port, name, channel, appVersion)
     }
 
     /** Netværkstråd: lyd (og start/slut-lyde) behandles her, så rækkefølgen bevares. */
@@ -210,7 +221,17 @@ class RadioService : Service() {
 
     private fun handle(e: HubEvent) {
         when (e) {
-            is HubEvent.Connected -> statusMsg = "Forbundet til $host"
+            is HubEvent.Connected -> { statusMsg = "Forbundet til $host"; lastError = null }
+            is HubEvent.SetChannel -> if (e.index in channelNames.indices && e.index != channel) {
+                channel = e.index        // hubben har flyttet/sorteret kanalerne
+                receivingFrom = null
+                saveChannel()
+            }
+            is HubEvent.Kicked -> {
+                flash(e.message)
+                disconnect()
+                offReason = "SMIDT AF HUBBEN"
+            }
             is HubEvent.Disconnected -> {
                 stopTx()
                 pttHeld = false
@@ -218,6 +239,7 @@ class RadioService : Service() {
                 receivingFrom = null
                 channelStatus = emptyList()
                 client = null
+                lastError = e.reason
                 if (wantConnected) {
                     statusMsg = "Afbrudt – prøver igen…"
                     ui.removeCallbacks(reconnect)

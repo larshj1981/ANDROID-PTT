@@ -1,10 +1,28 @@
 name: Byg apps
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.v.outputs.v }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          python3 tools/check_version.py
+          echo "v=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Røgtest af hub (Linux)
+        run: |
+          pip install numpy
+          python3 tests/smoke_test.py
+
   android:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,31 +33,42 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-      - run: gradle assembleDebug
+      - run: gradle assembleRelease
+      - run: cp app/build/outputs/apk/release/app-release.apk PTTRadio-Android-${{ needs.version.outputs.v }}.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: PTTRadio-android
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: PTTRadio-Android-${{ needs.version.outputs.v }}
+          path: PTTRadio-Android-${{ needs.version.outputs.v }}.apk
 
   windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r windows/requirements.txt pyinstaller
-      - run: >
-          pyinstaller --onefile --noconsole --name PTTRadio
+      - run: pip install -r windows/requirements.txt -r hub/requirements.txt pyinstaller pillow
+      - run: python tools/make_icons.py .
+      - name: Røgtest af hub (Windows)
+        run: python tests/smoke_test.py
+      - name: Byg PTTRadio (klient)
+        run: >
+          pyinstaller --onefile --noconsole --name PTTRadio-Windows-${{ needs.version.outputs.v }}
+          --icon pttradio.ico
           --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
           windows/pttradio_win.py
-      - run: pyinstaller --onefile --console --name PTTHub hub/hub.py
+      - name: Byg PTTHub (proceslinje)
+        run: >
+          pyinstaller --onefile --noconsole --name PTTHub-${{ needs.version.outputs.v }}
+          --icon ptthub.ico --paths hub
+          --hidden-import webui --hidden-import tray --hidden-import pystray._win32
+          hub/hub.py
       - name: Skærmbillede af interfacet
         continue-on-error: true
         timeout-minutes: 3
         shell: pwsh
         run: |
-          pip install pillow
           $env:PTT_SCREENSHOT = "$PWD\shot.png"
           python windows/pttradio_win.py
           foreach ($f in "shot.png","shot_menu.png") {
@@ -47,20 +76,34 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: PTTRadio-windows
+          name: PTTRadio-Windows-${{ needs.version.outputs.v }}
           path: |
-            dist/PTTRadio.exe
-            dist/PTTHub.exe
+            dist/PTTRadio-Windows-${{ needs.version.outputs.v }}.exe
+            dist/PTTHub-${{ needs.version.outputs.v }}.exe
+
+  hub-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p PTTHub-${{ needs.version.outputs.v }}-Linux
+          cp hub/hub.py hub/webui.py hub/ptthub.service hub/INSTALL-LINUX.txt PTTHub-${{ needs.version.outputs.v }}-Linux/
+          zip -r PTTHub-${{ needs.version.outputs.v }}-Linux.zip PTTHub-${{ needs.version.outputs.v }}-Linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PTTHub-${{ needs.version.outputs.v }}-Linux
+          path: PTTHub-${{ needs.version.outputs.v }}-Linux.zip
 
   android-screenshot:
-    needs: android
+    needs: [version, android]
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: PTTRadio-android
+          name: PTTRadio-Android-${{ needs.version.outputs.v }}
       - name: Aktivér KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -73,7 +116,7 @@ jobs:
           profile: pixel_5
           disable-animations: true
           script: |
-            adb install -r app-debug.apk
+            adb install -r PTTRadio-Android-${{ needs.version.outputs.v }}.apk
             adb shell pm grant dk.pttradio android.permission.RECORD_AUDIO
             adb shell am start -n dk.pttradio/.MainActivity
             sleep 6
@@ -83,3 +126,26 @@ jobs:
             adb exec-out screencap -p > on.png
             echo BEGIN-android_off.png; base64 -w 4000 off.png; echo END-android_off.png
             echo BEGIN-android_on.png; base64 -w 4000 on.png; echo END-android_on.png
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, android, windows, hub-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+      - run: ls -la dl
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: PTT Radio ${{ needs.version.outputs.v }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dl/PTTRadio-Android-${{ needs.version.outputs.v }}.apk
+            dl/PTTRadio-Windows-${{ needs.version.outputs.v }}.exe
+            dl/PTTHub-${{ needs.version.outputs.v }}.exe
+            dl/PTTHub-${{ needs.version.outputs.v }}-Linux.zip

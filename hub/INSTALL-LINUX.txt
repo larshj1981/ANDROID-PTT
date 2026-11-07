@@ -1,0 +1,21 @@
+PTT Hub på Linux / Raspberry Pi (kræver kun Python 3.9+)
+=========================================================
+
+Prøv den først:
+    python3 hub.py --no-tray
+    Åbn http://<maskinens-ip>:8080 i en browser og vælg en adgangskode.
+
+Installér som tjeneste, der starter automatisk:
+    sudo useradd --system --home /var/lib/ptthub --create-home ptthub
+    sudo mkdir -p /opt/ptthub && sudo cp hub.py webui.py /opt/ptthub/
+    sudo cp ptthub.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now ptthub
+
+Status og log:
+    systemctl status ptthub
+    journalctl -u ptthub -f
+    Logfiler: /var/lib/ptthub/logs/   (også i webinterfacet under "Log")
+
+Firewall (hvis ufw er slået til):
+    sudo ufw allow 50000/tcp && sudo ufw allow 50001/udp && sudo ufw allow 8080/tcp

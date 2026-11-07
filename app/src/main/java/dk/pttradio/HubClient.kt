@@ -17,7 +17,10 @@ data class ChannelState(val users: Int, val talker: String?)
 
 sealed class HubEvent {
     object Connected : HubEvent()
-    data class Disconnected(val reason: String) : HubEvent()
+    /** reason = kort tekst til displayet (fx "HUB SVARER IKKE"), detail = forklaring. */
+    data class Disconnected(val reason: String, val detail: String = "", val wasConnected: Boolean = false) : HubEvent()
+    data class SetChannel(val index: Int) : HubEvent()
+    data class Kicked(val message: String) : HubEvent()
     data class Channels(val names: List<String>) : HubEvent()
     data class Status(val channels: List<ChannelState>) : HubEvent()
     object Granted : HubEvent()
@@ -43,6 +46,22 @@ class HubClient(private val onEvent: (HubClient, HubEvent) -> Unit) {
         const val RX_START = 13
         const val RX_END = 14
         const val STATUS = 15
+        const val SET_CHANNEL = 16
+        const val KICK = 17
+
+        /** Kort, forståelig årsag til en forbindelsesfejl. */
+        fun describe(e: Throwable): Pair<String, String> = when (e) {
+            is java.net.UnknownHostException -> "FORKERT ADRESSE" to "adressen kunne ikke findes"
+            is java.net.SocketTimeoutException -> "INGEN FORBINDELSE" to
+                "intet svar – forkert adresse, computeren er slukket eller firewall blokerer"
+            is java.net.ConnectException ->
+                if ((e.message ?: "").contains("ECONNREFUSED") || (e.message ?: "").contains("refused", true))
+                    "HUB SVARER IKKE" to "computeren svarer, men hubben kører ikke (eller forkert port)"
+                else "NETVÆRK UTILGÆNGELIGT" to (e.message ?: "netværket kan ikke nå hubben")
+            is java.net.NoRouteToHostException -> "NETVÆRK UTILGÆNGELIGT" to "ingen vej til hubben"
+            is java.io.EOFException -> "FORBINDELSE TABT" to "hubben lukkede forbindelsen"
+            else -> "FORBINDELSE TABT" to (e.message ?: e.javaClass.simpleName)
+        }
     }
 
     @Volatile var connected = false
@@ -52,9 +71,11 @@ class HubClient(private val onEvent: (HubClient, HubEvent) -> Unit) {
     @Volatile private var out: DataOutputStream? = null
     private val writer = Executors.newSingleThreadScheduledExecutor()
 
-    fun connect(host: String, port: Int, name: String, channel: Int) {
+    fun connect(host: String, port: Int, name: String, channel: Int, version: String = "") {
         Thread {
-            var reason = "Forbindelsen blev lukket"
+            var reason = "FORBINDELSE TABT"
+            var detail = "forbindelsen blev lukket"
+            var wasConnected = false
             try {
                 val s = Socket()
                 socket = s
@@ -64,17 +85,21 @@ class HubClient(private val onEvent: (HubClient, HubEvent) -> Unit) {
                 s.soTimeout = 35_000
                 out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 4096))
                 connected = true
-                val hello = JSONObject().put("name", name).put("channel", channel).toString()
+                wasConnected = true
+                val hello = JSONObject().put("name", name).put("channel", channel)
+                    .put("version", version).put("platform", "Android").toString()
                 send(HELLO, hello.toByteArray(Charsets.UTF_8))
                 writer.scheduleAtFixedRate({ send(PING) }, 10, 10, TimeUnit.SECONDS)
                 onEvent(this, HubEvent.Connected)
                 readLoop(DataInputStream(BufferedInputStream(s.getInputStream())))
             } catch (e: Exception) {
-                reason = e.message ?: e.javaClass.simpleName
+                val d = describe(e)
+                reason = d.first
+                detail = d.second
             } finally {
                 val userClosed = closed
                 shutdown()
-                if (!userClosed) onEvent(this, HubEvent.Disconnected(reason))
+                if (!userClosed) onEvent(this, HubEvent.Disconnected(reason, detail, wasConnected))
             }
         }.start()
     }
@@ -104,6 +129,8 @@ class HubClient(private val onEvent: (HubClient, HubEvent) -> Unit) {
                 DENIED -> HubEvent.Denied(text())
                 RX_START -> HubEvent.RxStart(text())
                 RX_END -> HubEvent.RxEnd
+                SET_CHANNEL -> text().trim().toIntOrNull()?.let { HubEvent.SetChannel(it) }
+                KICK -> HubEvent.Kicked(text().ifBlank { "Smidt af hubben" })
                 else -> null
             }
             if (ev != null) onEvent(this, ev)

@@ -11,6 +11,8 @@ Eller brug den færdige PTTRadio.exe (bygges af GitHub Actions).
 """
 import array
 import json
+import logging
+import logging.handlers
 import math
 import os
 import queue
@@ -33,7 +35,7 @@ except ImportError:  # gør det muligt at teste kernen uden GUI
 
 # ------------------------------------------------------------------ protokol (samme som hub.py)
 HELLO, JOIN, PTT_START, AUDIO, PTT_END, PING = 1, 2, 3, 4, 5, 6
-CHANNELS, GRANTED, DENIED, RX_START, RX_END, STATUS = 10, 11, 12, 13, 14, 15
+CHANNELS, GRANTED, DENIED, RX_START, RX_END, STATUS, SET_CHANNEL, KICK = 10, 11, 12, 13, 14, 15, 16, 17
 HEADER = struct.Struct(">BI")
 
 RATE = 16000
@@ -42,6 +44,23 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 DEFAULT_PORT = 50000
 DISCOVERY_PORT = 50001
 APP_NAME = "PTT Radio"
+VERSION = "3.0.0"
+log = logging.getLogger("pttradio")
+
+
+def connect_error(e):
+    """Kort, forståelig årsag til at en forbindelse fejlede (vises på displayet og i loggen)."""
+    if isinstance(e, socket.gaierror):
+        return "FORKERT ADRESSE", f"adressen kunne ikke findes ({e})"
+    if isinstance(e, ConnectionRefusedError):
+        return "HUB SVARER IKKE", "computeren svarer, men hubben kører ikke (eller forkert port)"
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "INGEN FORBINDELSE", "intet svar – forkert adresse, computeren er slukket eller firewall blokerer"
+    if getattr(e, "errno", None) in (10051, 10065, 101, 113, 51, 65):
+        return "NETVÆRK UTILGÆNGELIGT", f"netværket kan ikke nå hubben ({e})"
+    if isinstance(e, ConnectionResetError):
+        return "FORBINDELSE TABT", "forbindelsen blev nulstillet"
+    return "FORBINDELSE TABT", str(e) or e.__class__.__name__
 
 
 def tone_pcm(freq, ms, vol=0.22, gap_ms=0, repeat=1):
@@ -266,9 +285,13 @@ class AudioPort:
 class RadioCore:
     """Trådsikker radiologik. `notify()` kaldes (fra vilkårlig tråd) når tilstanden ændres."""
 
-    def __init__(self, audio, notify=lambda: None):
+    def __init__(self, audio, notify=lambda: None, tag="Radio"):
         self.audio = audio
         self.notify = notify
+        self.tag = tag
+        self.error = None        # kort årsag til at forbindelsen fejler (vises på displayet)
+        self.off_reason = None   # hvorfor radioen er slukket (fx smidt af hubben)
+        self.on_channel = None   # kaldes når hubben flytter os til en anden kanal
         self.lock = threading.RLock()
         self.want = False
         self.online = False
@@ -301,13 +324,19 @@ class RadioCore:
             gen = self._gen
             self.want = True
             self.status_msg = "Forbinder…"
+            self.error = None
+            self.off_reason = None
             self._wake.clear()
+        log.info("%s: forbinder til %s:%s som '%s'", self.tag, host, port, name.strip())
         threading.Thread(target=self._run, args=(gen, host, port, name.strip() or socket.gethostname()),
                          daemon=True).start()
         self.notify()
 
-    def disconnect(self):
+    def disconnect(self, reason=None):
         with self.lock:
+            if self.want:
+                log.info("%s: afbryder%s", self.tag, f" ({reason})" if reason else "")
+            self.off_reason = reason
             self._gen += 1
             self.want = False
             self._stop_tx()
@@ -328,8 +357,10 @@ class RadioCore:
         return self.want and gen == self._gen
 
     def _run(self, gen, host, port, name):
+        last_logged = None
         while self._alive(gen):
             sock = None
+            connected = False
             try:
                 sock = socket.create_connection((host, port), timeout=5)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -342,13 +373,26 @@ class RadioCore:
                         return
                     self._sock, self._sendq = sock, q
                     self.online = True
+                    self.error = None
                     self.status_msg = f"Forbundet til {host}"
+                connected = True
+                last_logged = None
+                log.info("%s: forbundet til %s:%s", self.tag, host, port)
                 threading.Thread(target=self._writer, args=(sock, q), daemon=True).start()
-                self.send(HELLO, json.dumps({"name": name[:24], "channel": self.channel}).encode())
+                self.send(HELLO, json.dumps({"name": name[:24], "channel": self.channel, "version": VERSION,
+                                             "platform": "Windows"}).encode())
                 self.notify()
                 self._read_loop(sock, gen)
-            except OSError:
-                pass
+            except (OSError, ConnectionError, ValueError) as e:
+                if self._alive(gen):
+                    short, detail = connect_error(e)
+                    with self.lock:
+                        self.error = short
+                    if connected:
+                        log.warning("%s: forbindelsen til hubben blev afbrudt – %s", self.tag, detail)
+                    elif detail != last_logged:  # undgå samme linje hvert 3. sekund
+                        log.warning("%s: kan ikke forbinde til %s:%s – %s", self.tag, host, port, detail)
+                        last_logged = detail
             finally:
                 if sock:
                     try:
@@ -402,7 +446,11 @@ class RadioCore:
 
     def _read_loop(self, sock, gen):
         while self._alive(gen):
-            t, n = HEADER.unpack(self._recv_exact(sock, HEADER.size))
+            try:
+                hdr = self._recv_exact(sock, HEADER.size)
+            except socket.timeout:
+                raise TimeoutError("intet fra hubben i 35 sek.")
+            t, n = HEADER.unpack(hdr)
             if n > 1_000_000:
                 raise ConnectionError("ugyldig pakke")
             p = self._recv_exact(sock, n) if n else b""
@@ -426,15 +474,31 @@ class RadioCore:
                     self.send(JOIN, b"0")
             elif t == STATUS:
                 self.channel_status = json.loads(p.decode())
+            elif t == SET_CHANNEL:  # hubben har flyttet/sorteret kanalerne
+                try:
+                    idx = int(p.decode())
+                except ValueError:
+                    idx = self.channel
+                if idx != self.channel and 0 <= idx < len(self.channel_names):
+                    log.info("%s: flyttet af hubben til CH%d (%s)", self.tag, idx + 1, self.channel_names[idx])
+                    self.channel = idx
+                    if self.on_channel:
+                        self.on_channel()
+            elif t == KICK:
+                msg = p.decode(errors="replace") or "Smidt af hubben"
+                log.warning("%s: %s", self.tag, msg)
+                threading.Thread(target=self.disconnect, args=("SMIDT AF HUBBEN",), daemon=True).start()
             elif t == GRANTED:
                 if self.ptt_held and not self.transmitting:
                     self._start_tx()
             elif t == DENIED:
+                log.info("%s: optaget – %s taler", self.tag, p.decode(errors="replace"))
                 if self.ptt_held:
                     self.audio.play(TONE_BUSY, immediate=True)
                     self._flash(f"Optaget – {p.decode(errors='replace')} taler")
             elif t == RX_START:
                 self.receiving = p.decode(errors="replace")
+                log.info("%s: modtager fra %s på CH%d", self.tag, self.receiving, self.channel + 1)
                 if not self.transmitting:
                     self.audio.play(self.fx.start_sound(), immediate=True)
             elif t == RX_END:
@@ -487,13 +551,16 @@ class RadioCore:
         if not self.audio.start_input(on_chunk):
             self.send(PTT_END)
             self._flash("Mikrofonen kunne ikke startes")
+            log.error("%s: mikrofonen kunne ikke startes", self.tag)
             return
         self.transmitting = True
+        log.info("%s: sender på CH%d", self.tag, self.channel + 1)
 
     def _stop_tx(self):
         if self.transmitting:
             self.transmitting = False
             self.audio.stop_input()
+            log.info("%s: stoppede med at sende", self.tag)
 
     def set_channel(self, idx):
         if 0 <= idx < len(self.channel_names):
@@ -507,6 +574,7 @@ class RadioCore:
             self.channel = (self.channel + delta) % n
             self.receiving = None
             self.send(JOIN, str(self.channel).encode())
+            log.info("%s: skiftede til CH%d (%s)", self.tag, self.channel + 1, self.channel_names[self.channel])
         self.audio.clear()
         self.audio.play(TONE_CLICK, immediate=True)
         self.notify()
@@ -738,7 +806,7 @@ class Net:
     def __init__(self, idx, audio, notify, cfg):
         self.idx = idx
         self.port = audio.port()
-        self.core = RadioCore(self.port, notify=notify)
+        self.core = RadioCore(self.port, notify=notify, tag=f"Net {idx + 1}")
         self.cfg = cfg
         self.core.channel = int(cfg.get("channel", idx))
         self.port.muted = bool(cfg.get("muted", False))
@@ -765,6 +833,7 @@ class RadioUI:
         self.nets = [Net(i, self.audio, self._dirty.set, self.settings["nets"][i]) for i in range(NETS)]
         for n in self.nets:
             n.core.fx.set_mode(self.settings.get("mode", "digital"))
+            n.core.on_channel = lambda: self.root.after(0, self._save)
         self.volume = int(self.settings.get("volume", 7))
         self._apply_volume()
         self._apply_pan()
@@ -778,7 +847,7 @@ class RadioUI:
         self.s = max(0.5, min(dpi, (root.winfo_screenwidth() - 40) / self.W,
                               (root.winfo_screenheight() - 130 * dpi) / self.H))
 
-        root.title(APP_NAME)
+        root.title(f"{APP_NAME} {VERSION}")
         root.configure(bg=BG)
         root.resizable(False, False)
         pos = self.settings.get("position")
@@ -1048,7 +1117,7 @@ class RadioUI:
             return
         m = tk.Toplevel(self.root)
         self.menu = m
-        m.title("Indstillinger – " + APP_NAME)
+        m.title(f"Indstillinger – {APP_NAME} {VERSION}")
         m.configure(bg=BG, padx=16, pady=14)
         m.resizable(False, False)
         m.transient(self.root)
@@ -1134,7 +1203,7 @@ class RadioUI:
         for i in range(NETS):
             lbl(f"Net {i + 1}", r, head=True)
             check("Aktiv", act[i], r); r += 1
-            lbl("Hub (tom = fælles)", r); entry(nhost[i], r); r += 1
+            lbl("Anden hub (normalt tom)", r); entry(nhost[i], r); r += 1
             lbl("PTT-tast", r)
             kb = btn(m, key_label(keys[i]) + "    (klik for at skifte)")
             kb.grid(row=r, column=1, sticky="ew", padx=(10, 0))
@@ -1171,7 +1240,7 @@ class RadioUI:
             row=r, column=0, columnspan=3, sticky="w", pady=(10, 4)); r += 1
 
         bar = tk.Frame(m, bg=BG)
-        bar.grid(row=r, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        bar.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         def save():
             self.hotkeys.capture_cb = None
@@ -1197,7 +1266,16 @@ class RadioUI:
             self.hotkeys.capture_cb = None
             m.destroy()
 
+        def open_logs():
+            d = os.path.join(os.path.dirname(settings_path()), "logs")
+            try:
+                os.startfile(d)  # type: ignore[attr-defined]
+            except Exception:
+                messagebox.showinfo(APP_NAME, f"Logfilerne ligger i:\n{d}", parent=m)
+
         m.protocol("WM_DELETE_WINDOW", cancel)
+        tk.Label(bar, text=f"Version {VERSION}", bg=BG, fg="#5E6365", font=("Segoe UI", 8)).pack(side="left", padx=(0, 12))
+        btn(bar, "Åbn logmappe", open_logs).pack(side="left")
         btn(bar, "Annullér", cancel).pack(side="right", padx=(6, 0))
         btn(bar, "Gem", save).pack(side="right")
         m.columnconfigure(1, weight=1)
@@ -1286,6 +1364,8 @@ class RadioUI:
                     c.itemconfigure(u[k], text="")
                 c.itemconfigure(u["big"], text="OFF")
                 c.itemconfigure(u["name"], text="KLIK FOR AT TÆNDE" if i else "SE INDSTILLINGER")
+                if core.off_reason:
+                    c.itemconfigure(u["status"], text=core.off_reason)
                 if flash:
                     c.itemconfigure(u["status"], text=flash.upper()[:24])
                 continue
@@ -1303,7 +1383,7 @@ class RadioUI:
             here = status[ch] if ch < len(status) else {}
             show_lvl = False
             if not online:
-                line = "SØGER HUB" + "." * (int(now * 2) % 4)
+                line = (core.error or "SØGER HUB") + "." * (int(now * 2) % 4)
             elif flash:
                 line = flash.upper()[:24]
             elif tx:
@@ -1332,7 +1412,7 @@ class RadioUI:
 
         for k, seg in enumerate(self.vol_segs):
             c.itemconfigure(seg, fill="#a9c98a" if k < self.volume else "")
-        t = (" | ".join(titles) + " – " if titles else "") + APP_NAME
+        t = (" | ".join(titles) + " – " if titles else "") + f"{APP_NAME} {VERSION}"
         if self.root.title() != t:
             self.root.title(t)
 
@@ -1375,7 +1455,24 @@ def _screenshot_mode(ui, path):
     ui.root.after(1200, setup)
 
 
+def setup_logging():
+    """Logfil: %APPDATA%\\PTTRadio\\logs\\pttradio.log (roterer ved 1 MB, 5 gamle gemmes)."""
+    d = os.path.join(os.path.dirname(settings_path()), "logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(os.path.join(d, "pttradio.log"), maxBytes=1_000_000,
+                                                 backupCount=5, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        root = logging.getLogger()
+        root.addHandler(h)
+        root.setLevel(logging.INFO)
+    except OSError:
+        pass
+    log.info("PTT Radio %s startet (Windows)", VERSION)
+
+
 def main():
+    setup_logging()
     if sys.platform == "win32":
         try:  # skarp tekst på skærme med skalering
             import ctypes

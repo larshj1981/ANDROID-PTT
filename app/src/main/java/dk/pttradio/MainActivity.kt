@@ -218,7 +218,7 @@ class MainActivity : Activity(), RadioView.Listener {
             val hasHost = !getSharedPreferences("ptt", MODE_PRIVATE).getString("host", "").isNullOrBlank()
             view.state = RadioView.State(
                 big = "OFF", name = if (hasHost) "TRYK HER FOR AT TÆNDE" else "SE INDSTILLINGER",
-                muted = muted, volume = volumeLevel()
+                status = r?.offReason ?: "", muted = muted, volume = volumeLevel()
             )
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             return
@@ -229,7 +229,7 @@ class MainActivity : Activity(), RadioView.Listener {
         val here = status.getOrNull(ch)
         val flash = r?.flashMsg
         val line = when {
-            !online -> "SØGER HUB" + ".".repeat(((now / 500) % 4).toInt())
+            !online -> (r?.lastError ?: "SØGER HUB") + ".".repeat(((now / 500) % 4).toInt())
             flash != null -> flash.uppercase().take(24)
             tx -> ""
             held -> "VENTER..."
@@ -351,7 +351,7 @@ class MainActivity : Activity(), RadioView.Listener {
         }
 
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Indstillinger")
+            .setTitle("Indstillinger · PTT Radio ${radio?.appVersion ?: ""}")
             .setView(box)
             .setPositiveButton("Gem og tænd") { _, _ ->
                 val changed = save()
