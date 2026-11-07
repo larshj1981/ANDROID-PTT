@@ -99,6 +99,7 @@ class RadioService : Service() {
     val online: Boolean get() = client?.connected == true
 
     private var host = ""
+    val targetLabel: String get() = if (port == DEFAULT_PORT) host else "$host:$port"
     private var port = DEFAULT_PORT
     private var name = ""
 

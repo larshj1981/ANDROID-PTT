@@ -76,9 +76,10 @@ def run(hub, new_loop, first_run=False):
 
     def quit_(icon, item):
         log.info("PTT Hub lukkes fra proceslinjen")
+        hub.request_stop()
+        t.join(5)
         icon.visible = False
         icon.stop()
-        loop.call_soon_threadsafe(loop.stop)
 
     menu = pystray.Menu(
         pystray.MenuItem("Åbn webinterface", open_web, default=True),

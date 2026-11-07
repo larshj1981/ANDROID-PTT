@@ -27,7 +27,7 @@ import struct
 import sys
 import time
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 # Klient -> hub
 HELLO, JOIN, PTT_START, AUDIO, PTT_END, PING = 1, 2, 3, 4, 5, 6
@@ -570,9 +570,21 @@ class Hub:
         log.info("PTT Hub %s '%s' startet – radio-port %s, web http://%s:%s – %d kanaler: %s",
                  VERSION, self.cfg["name"], self.cfg["port"], (local_ips() or ["localhost"])[0],
                  self.cfg["web_port"], len(self.names), ", ".join(self.names))
+        self._stop = asyncio.Event()
         if ready:
             ready()
-        await asyncio.Event().wait()
+        await self._stop.wait()
+        for c in list(self.clients):
+            c.writer.close()
+        if self.server:
+            self.server.close()
+        if self.web:
+            await self.web.stop()
+
+    def request_stop(self):
+        """Kan kaldes fra en anden tråd (fx ikonet i proceslinjen)."""
+        if self.loop and getattr(self, "_stop", None):
+            self.loop.call_soon_threadsafe(self._stop.set)
 
     def _loop_error(self, loop, context):
         exc = context.get("exception")

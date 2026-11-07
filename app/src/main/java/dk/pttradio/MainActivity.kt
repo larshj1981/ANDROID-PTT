@@ -229,7 +229,8 @@ class MainActivity : Activity(), RadioView.Listener {
         val here = status.getOrNull(ch)
         val flash = r?.flashMsg
         val line = when {
-            !online -> (r?.lastError ?: "SØGER HUB") + ".".repeat(((now / 500) % 4).toInt())
+            !online -> (r?.lastError?.let { "$it: ${r.targetLabel}" } ?: "SØGER HUB").take(24) +
+                ".".repeat(((now / 500) % 4).toInt())
             flash != null -> flash.uppercase().take(24)
             tx -> ""
             held -> "VENTER..."

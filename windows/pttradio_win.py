@@ -44,7 +44,7 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 DEFAULT_PORT = 50000
 DISCOVERY_PORT = 50001
 APP_NAME = "PTT Radio"
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 log = logging.getLogger("pttradio")
 
 
@@ -71,6 +71,16 @@ def parse_address(text):
         port = DEFAULT_PORT
         notes.append("8080 er webinterfacets port – bruger radio-porten 50000")
     return host.strip("."), port, ", ".join(notes)
+
+
+def looks_like_address(text):
+    """Groft tjek af en hub-adresse: IP-adresse, 'localhost' eller et navn (fx min-pc eller min-pc.local)."""
+    host, _, _ = parse_address(text)
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+        return all(int(x) <= 255 for x in host.split("."))
+    if host.isdigit() or not host:
+        return False  # fx '1' – typisk en tast, der er havnet i feltet ved en fejl
+    return bool(re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9-]+)*", host))
 
 
 def connect_error(e):
@@ -314,6 +324,7 @@ class RadioCore:
         self.audio = audio
         self.notify = notify
         self.tag = tag
+        self.target = ""
         self.error = None        # kort årsag til at forbindelsen fejler (vises på displayet)
         self.off_reason = None   # hvorfor radioen er slukket (fx smidt af hubben)
         self.on_channel = None   # kaldes når hubben flytter os til en anden kanal
@@ -339,6 +350,7 @@ class RadioCore:
     # --- forbindelse
     def connect(self, host_port, name):
         host, port, note = parse_address(host_port)
+        self.target = host if port == DEFAULT_PORT else f"{host}:{port}"
         if note:
             log.info("%s: adressen '%s' tolket som %s:%s (%s)", self.tag, host_port.strip(), host, port, note)
         with self.lock:
@@ -899,6 +911,11 @@ class RadioUI:
     # ---------------------------------------------------------- indstillinger
     def _migrate(self):
         st = self.settings
+        for i, n in enumerate(st.get("nets") or []):
+            h = str(n.get("host") or "").strip()
+            if h and not looks_like_address(h):
+                log.warning("Net %d: ugyldig 'anden hub' (%r) fjernet – bruger den fælles hub-adresse", i + 1, h)
+                n["host"] = ""
         nets = st.get("nets")
         if not isinstance(nets, list) or len(nets) < NETS:
             old_key = _LEGACY.get(st.get("hotkey", "F8"), "key:f8")
@@ -1127,6 +1144,8 @@ class RadioUI:
         self._apply_power()
 
     def _typing_in_menu(self):
+        if getattr(self, "_capturing", False):
+            return True
         try:
             return bool(self.menu and self.menu.winfo_exists() and isinstance(self.root.focus_get(), tk.Entry))
         except (tk.TclError, KeyError):
@@ -1237,6 +1256,8 @@ class RadioUI:
                 messagebox.showinfo(APP_NAME, "Genvejstaster kræver modulet pynput.", parent=m)
                 return
             key_btns[i].configure(text="Tryk på en tast eller museknap…  (Esc = annullér)", bg="#5a4a1a")
+            m.focus_set()  # fokus væk fra tekstfelterne, så tasten ikke også bliver skrevet ind i et felt
+            self._capturing = True
 
             def got(kid):
                 def apply():
@@ -1249,6 +1270,8 @@ class RadioUI:
                             key_btns[other].configure(text=key_label("") + "    (klik for at skifte)")
                         keys[i] = kid
                     key_btns[i].configure(text=key_label(keys[i]) + "    (klik for at skifte)", bg="#2A2D2E")
+                    # tasten må ikke "slippe igennem" til et felt, mens den slippes
+                    self.root.after(400, lambda: setattr(self, "_capturing", False))
                 self.root.after(0, apply)
             self.hotkeys.capture(got)
 
@@ -1265,6 +1288,16 @@ class RadioUI:
         bar.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         def save():
+            bad = []
+            if host.get().strip() and not looks_like_address(host.get()):
+                bad.append(f"Hub-adresse: '{host.get().strip()}'")
+            for i in range(NETS):
+                if nhost[i].get().strip() and not looks_like_address(nhost[i].get()):
+                    bad.append(f"Net {i + 1}, anden hub: '{nhost[i].get().strip()}'")
+            if bad:
+                messagebox.showwarning(APP_NAME, "Det ligner ikke en hub-adresse:\n\n" + "\n".join(bad) +
+                                       "\n\nSkriv fx 192.168.1.71 – eller lad 'Anden hub' være tom.", parent=m)
+                return
             self.hotkeys.capture_cb = None
             self.settings["host"] = host.get().strip()
             self.settings["name"] = name.get().strip()
@@ -1405,7 +1438,8 @@ class RadioUI:
             here = status[ch] if ch < len(status) else {}
             show_lvl = False
             if not online:
-                line = (core.error or "SØGER HUB") + "." * (int(now * 2) % 4)
+                line = ((f"{core.error}: {core.target}" if core.error else "SØGER HUB")[:24]
+                        + "." * (int(now * 2) % 4))
             elif flash:
                 line = flash.upper()[:24]
             elif tx:
