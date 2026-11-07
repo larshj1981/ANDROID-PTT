@@ -1,4 +1,12 @@
-## PTT Radio 3.0.2
+## PTT Radio 3.0.3
+
+**Rettet**
+- Android: hold-for-at-tale med headset-knappen virker nu, når appen er på skærmen – også med USB-C- og
+  Bluetooth-headset, der sender "play/pause" i stedet for den gamle headset-knap.
+  Med slukket skærm eller appen i baggrunden: kort klik = start sending, klik igen = stop
+  (Android sender et langt tryk videre til stemmeassistenten, ikke til apps).
+
+### 3.0.2
 
 **Rettet**
 - Windows: når man valgte en PTT-tast (fx `1`), blev tasten også skrevet ind i feltet "Anden hub", så nettet prøvede
@@ -19,10 +27,10 @@ Alt fra 3.0.0 herunder gælder stadig.
 ### 3.0.0
 
 **Filer**
-- `PTTRadio-Android-3.0.2.apk` – Android-appen
-- `PTTRadio-Windows-3.0.2.exe` – Windows-klienten (2 net)
-- `PTTHub-3.0.2.exe` – hubben til Windows (ikon i proceslinjen, webinterface)
-- `PTTHub-3.0.2-Linux.zip` – hubben til Linux / Raspberry Pi
+- `PTTRadio-Android-3.0.3.apk` – Android-appen
+- `PTTRadio-Windows-3.0.3.exe` – Windows-klienten (2 net)
+- `PTTHub-3.0.3.exe` – hubben til Windows (ikon i proceslinjen, webinterface)
+- `PTTHub-3.0.3-Linux.zip` – hubben til Linux / Raspberry Pi
 
 **Nyt i 3.0**
 - Hub: kører i baggrunden med ikon i proceslinjen og starter ved login
@@ -38,5 +46,5 @@ Alt fra 3.0.0 herunder gælder stadig.
 
 **Opgradering**
 - Android: afinstallér den gamle app én gang, før 3.0 installeres (ny signering).
-- Hub: luk den gamle PTTHub.exe og start PTTHub-3.0.2.exe. Kanalnavne overføres fra den gamle indstillingsfil,
+- Hub: luk den gamle PTTHub.exe og start PTTHub-3.0.3.exe. Kanalnavne overføres fra den gamle indstillingsfil,
   hvis den nye exe ligger i samme mappe.

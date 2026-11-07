@@ -27,7 +27,7 @@ import struct
 import sys
 import time
 
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 # Klient -> hub
 HELLO, JOIN, PTT_START, AUDIO, PTT_END, PING = 1, 2, 3, 4, 5, 6

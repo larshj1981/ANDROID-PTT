@@ -407,8 +407,19 @@ class MainActivity : Activity(), RadioView.Listener {
         return super.onKeyUp(keyCode, event)
     }
 
-    private fun isPttKey(code: Int) =
-        code == KeyEvent.KEYCODE_VOLUME_DOWN || code == KeyEvent.KEYCODE_HEADSETHOOK
+    /**
+     * PTT-knapper når appen er på skærmen: lydstyrke ned og headset-/Bluetooth-knappen.
+     * USB-C- og Bluetooth-headset sender typisk "play/pause" i stedet for den gamle headset-knap.
+     * Når appen er på skærmen, får vi selv knaptrykkene, så hold-for-at-tale virker.
+     * (Med slukket skærm tager Android et langt tryk til stemmeassistenten – se RadioService.mediaKey.)
+     */
+    private fun isPttKey(code: Int): Boolean = when (code) {
+        KeyEvent.KEYCODE_VOLUME_DOWN -> true
+        KeyEvent.KEYCODE_HEADSETHOOK, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+        KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE ->
+            getSharedPreferences("ptt", MODE_PRIVATE).getBoolean("mediaptt", true)
+        else -> false
+    }
 
     // ---------------------------------------------------------------- tilladelser
 

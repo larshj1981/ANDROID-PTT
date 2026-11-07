@@ -44,7 +44,7 @@ CHUNK_BYTES = CHUNK_SAMPLES * 2
 DEFAULT_PORT = 50000
 DISCOVERY_PORT = 50001
 APP_NAME = "PTT Radio"
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 log = logging.getLogger("pttradio")
 
 
